@@ -221,6 +221,33 @@ public class PendingAcksMapTest {
     }
 
     @Test
+    public void getAndRemoveAndGet_PreservePackedPendingAckFields() {
+        Consumer consumer = createMockConsumer("consumer1");
+        PendingAcksMap pendingAcksMap = new PendingAcksMap(consumer, () -> null, () -> null);
+        pendingAcksMap.addPendingAckIfAllowed(1L, 1L, Integer.MAX_VALUE, -123);
+
+        IntIntPair pendingAck = pendingAcksMap.get(1L, 1L);
+
+        assertTrue(pendingAck != null);
+        assertEquals(pendingAck.leftInt(), Integer.MAX_VALUE);
+        assertEquals(pendingAck.rightInt(), -123);
+        assertEquals(pendingAcksMap.getRemainingUnacked(1L, 1L), Integer.MAX_VALUE);
+        assertEquals(pendingAcksMap.getRemainingUnacked(1L, 2L), -1);
+
+        IntIntPair removed = pendingAcksMap.removeAndGet(1L, 1L);
+
+        assertTrue(removed != null);
+        assertEquals(removed.leftInt(), Integer.MAX_VALUE);
+        assertEquals(removed.rightInt(), -123);
+        assertFalse(pendingAcksMap.contains(1L, 1L));
+
+        pendingAcksMap.addPendingAckIfAllowed(1L, 1L, Integer.MAX_VALUE, -123);
+
+        assertEquals(pendingAcksMap.removeAndGetRemainingUnacked(1L, 1L), Integer.MAX_VALUE);
+        assertEquals(pendingAcksMap.removeAndGetRemainingUnacked(1L, 1L), -1);
+    }
+
+    @Test
     public void forEachAndClear_ProcessesAndClearsAllPendingAcks() {
         Consumer consumer = createMockConsumer("consumer1");
         PendingAcksMap pendingAcksMap = new PendingAcksMap(consumer, () -> null, () -> null);
@@ -297,6 +324,19 @@ public class PendingAcksMapTest {
 
         pendingAcksMap.removeAndGet(1L, 1L);
 
+        verify(removeHandler).handleRemoving(consumer, 1L, 1L, 123, false);
+    }
+
+    @Test
+    public void removeAndGetRemainingUnacked_InvokesRemoveHandler() {
+        Consumer consumer = createMockConsumer("consumer1");
+        PendingAcksMap.PendingAcksRemoveHandler removeHandler = mock(PendingAcksMap.PendingAcksRemoveHandler.class);
+        PendingAcksMap pendingAcksMap = new PendingAcksMap(consumer, () -> null, () -> removeHandler);
+        pendingAcksMap.addPendingAckIfAllowed(1L, 1L, 5, 123);
+
+        int remainingUnacked = pendingAcksMap.removeAndGetRemainingUnacked(1L, 1L);
+
+        assertEquals(remainingUnacked, 5);
         verify(removeHandler).handleRemoving(consumer, 1L, 1L, 123, false);
     }
 }

@@ -18,9 +18,12 @@
  */
 package org.apache.pulsar.broker.service;
 
+import it.unimi.dsi.fastutil.longs.Long2LongMap;
+import it.unimi.dsi.fastutil.longs.Long2LongRBTreeMap;
+import it.unimi.dsi.fastutil.longs.Long2LongSortedMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectRBTreeMap;
 import java.util.Iterator;
-import java.util.Map;
-import java.util.TreeMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -39,6 +42,8 @@ import org.apache.pulsar.common.util.collections.IntIntPair;
  * running.
  */
 public class PendingAcksMap {
+    private static final long PENDING_ACK_NOT_FOUND = Long.MIN_VALUE;
+
     /**
      * Callback interface for handling the addition of pending acknowledgments.
      */
@@ -97,7 +102,7 @@ public class PendingAcksMap {
     }
 
     private final Consumer consumer;
-    private final TreeMap<Long, TreeMap<Long, IntIntPair>> pendingAcks;
+    private final Long2ObjectRBTreeMap<Long2LongRBTreeMap> pendingAcks;
     private final Supplier<PendingAcksAddHandler> pendingAcksAddHandlerSupplier;
     private final Supplier<PendingAcksRemoveHandler> pendingAcksRemoveHandlerSupplier;
     private final Lock readLock;
@@ -107,7 +112,7 @@ public class PendingAcksMap {
     PendingAcksMap(Consumer consumer, Supplier<PendingAcksAddHandler> pendingAcksAddHandlerSupplier,
                    Supplier<PendingAcksRemoveHandler> pendingAcksRemoveHandlerSupplier) {
         this.consumer = consumer;
-        this.pendingAcks = new TreeMap<>();
+        this.pendingAcks = new Long2ObjectRBTreeMap<>();
         this.pendingAcksAddHandlerSupplier = pendingAcksAddHandlerSupplier;
         this.pendingAcksRemoveHandlerSupplier = pendingAcksRemoveHandlerSupplier;
         ReadWriteLock readWriteLock = new ReentrantReadWriteLock();
@@ -143,9 +148,12 @@ public class PendingAcksMap {
                     && !pendingAcksAddHandler.handleAdding(consumer, ledgerId, entryId, stickyKeyHash)) {
                 return false;
             }
-            TreeMap<Long, IntIntPair> ledgerPendingAcks =
-                    pendingAcks.computeIfAbsent(ledgerId, k -> new TreeMap<>());
-            ledgerPendingAcks.put(entryId, IntIntPair.of(remainingUnacked, stickyKeyHash));
+            Long2LongRBTreeMap ledgerPendingAcks = pendingAcks.get(ledgerId);
+            if (ledgerPendingAcks == null) {
+                ledgerPendingAcks = newLedgerPendingAcks();
+                pendingAcks.put(ledgerId, ledgerPendingAcks);
+            }
+            ledgerPendingAcks.put(entryId, pack(remainingUnacked, stickyKeyHash));
             return true;
         } finally {
             writeLock.unlock();
@@ -160,7 +168,7 @@ public class PendingAcksMap {
     public long size() {
         try {
             readLock.lock();
-            return pendingAcks.values().stream().mapToInt(TreeMap::size).sum();
+            return pendingAcks.values().stream().mapToInt(Long2LongRBTreeMap::size).sum();
         } finally {
             readLock.unlock();
         }
@@ -184,15 +192,15 @@ public class PendingAcksMap {
     private void processPendingAcks(PendingAcksConsumer processor) {
         // this code uses for loops intentionally, don't refactor to use forEach
         // iterate the outer map
-        for (Map.Entry<Long, TreeMap<Long, IntIntPair>> entry : pendingAcks.entrySet()) {
-            long ledgerId = entry.getKey();
-            TreeMap<Long, IntIntPair> ledgerPendingAcks = entry.getValue();
+        for (Long2ObjectMap.Entry<Long2LongRBTreeMap> entry : pendingAcks.long2ObjectEntrySet()) {
+            long ledgerId = entry.getLongKey();
+            Long2LongRBTreeMap ledgerPendingAcks = entry.getValue();
             // iterate the inner map
-            for (Map.Entry<Long, IntIntPair> e : ledgerPendingAcks.entrySet()) {
-                long entryId = e.getKey();
-                IntIntPair batchSizeAndStickyKeyHash = e.getValue();
-                processor.accept(ledgerId, entryId, batchSizeAndStickyKeyHash.leftInt(),
-                        batchSizeAndStickyKeyHash.rightInt());
+            for (Long2LongMap.Entry e : ledgerPendingAcks.long2LongEntrySet()) {
+                long entryId = e.getLongKey();
+                long batchSizeAndStickyKeyHash = e.getLongValue();
+                processor.accept(ledgerId, entryId, remainingUnacked(batchSizeAndStickyKeyHash),
+                        stickyKeyHash(batchSizeAndStickyKeyHash));
             }
         }
     }
@@ -254,7 +262,7 @@ public class PendingAcksMap {
     public boolean contains(long ledgerId, long entryId) {
         try {
             readLock.lock();
-            TreeMap<Long, IntIntPair> ledgerMap = pendingAcks.get(ledgerId);
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
             if (ledgerMap == null) {
                 return false;
             }
@@ -274,11 +282,39 @@ public class PendingAcksMap {
     public IntIntPair get(long ledgerId, long entryId) {
         try {
             readLock.lock();
-            TreeMap<Long, IntIntPair> ledgerMap = pendingAcks.get(ledgerId);
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
             if (ledgerMap == null) {
                 return null;
             }
-            return ledgerMap.get(entryId);
+            long pendingAck = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, pendingAck)) {
+                return null;
+            }
+            return unpack(pendingAck);
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    /**
+     * Get the remaining unacked count for the given ledger ID and entry ID without allocating an {@link IntIntPair}.
+     *
+     * @param ledgerId the ledger ID
+     * @param entryId the entry ID
+     * @return the remaining unacked count, or {@code -1} if not found
+     */
+    public int getRemainingUnacked(long ledgerId, long entryId) {
+        try {
+            readLock.lock();
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
+            if (ledgerMap == null) {
+                return -1;
+            }
+            long pendingAck = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, pendingAck)) {
+                return -1;
+            }
+            return remainingUnacked(pendingAck);
         } finally {
             readLock.unlock();
         }
@@ -296,18 +332,24 @@ public class PendingAcksMap {
     public boolean remove(long ledgerId, long entryId, int batchSize, int stickyKeyHash) {
         try {
             writeLock.lock();
-            TreeMap<Long, IntIntPair> ledgerMap = pendingAcks.get(ledgerId);
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
             if (ledgerMap == null) {
                 return false;
             }
-            boolean removed = ledgerMap.remove(entryId, IntIntPair.of(batchSize, stickyKeyHash));
-            if (removed) {
-                handleRemovePendingAck(ledgerId, entryId, stickyKeyHash);
+            long current = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, current)) {
+                return false;
             }
-            if (removed && ledgerMap.isEmpty()) {
+            long expected = pack(batchSize, stickyKeyHash);
+            if (current != expected) {
+                return false;
+            }
+            ledgerMap.remove(entryId);
+            handleRemovePendingAck(ledgerId, entryId, stickyKeyHash);
+            if (ledgerMap.isEmpty()) {
                 pendingAcks.remove(ledgerId);
             }
-            return removed;
+            return true;
         } finally {
             writeLock.unlock();
         }
@@ -325,16 +367,16 @@ public class PendingAcksMap {
     public boolean updateRemainingUnacked(long ledgerId, long entryId, int ackedDelta) {
         try {
             writeLock.lock();
-            TreeMap<Long, IntIntPair> ledgerMap = pendingAcks.get(ledgerId);
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
             if (ledgerMap == null) {
                 return false;
             }
-            IntIntPair current = ledgerMap.get(entryId);
-            if (current == null) {
+            long current = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, current)) {
                 return false;
             }
-            int newRemaining = current.leftInt() - ackedDelta;
-            ledgerMap.put(entryId, IntIntPair.of(newRemaining, current.rightInt()));
+            int newRemaining = remainingUnacked(current) - ackedDelta;
+            ledgerMap.put(entryId, pack(newRemaining, stickyKeyHash(current)));
             return true;
         } finally {
             writeLock.unlock();
@@ -351,20 +393,20 @@ public class PendingAcksMap {
     public boolean remove(long ledgerId, long entryId) {
         try {
             writeLock.lock();
-            TreeMap<Long, IntIntPair> ledgerMap = pendingAcks.get(ledgerId);
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
             if (ledgerMap == null) {
                 return false;
             }
-            IntIntPair removedEntry = ledgerMap.remove(entryId);
-            boolean removed = removedEntry != null;
-            if (removed) {
-                int stickyKeyHash = removedEntry.rightInt();
-                handleRemovePendingAck(ledgerId, entryId, stickyKeyHash);
+            long removedEntry = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, removedEntry)) {
+                return false;
             }
-            if (removed && ledgerMap.isEmpty()) {
+            ledgerMap.remove(entryId);
+            handleRemovePendingAck(ledgerId, entryId, stickyKeyHash(removedEntry));
+            if (ledgerMap.isEmpty()) {
                 pendingAcks.remove(ledgerId);
             }
-            return removed;
+            return true;
         } finally {
             writeLock.unlock();
         }
@@ -382,18 +424,49 @@ public class PendingAcksMap {
     public IntIntPair removeAndGet(long ledgerId, long entryId) {
         try {
             writeLock.lock();
-            TreeMap<Long, IntIntPair> ledgerMap = pendingAcks.get(ledgerId);
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
             if (ledgerMap == null) {
                 return null;
             }
-            IntIntPair removedEntry = ledgerMap.remove(entryId);
-            if (removedEntry != null) {
-                handleRemovePendingAck(ledgerId, entryId, removedEntry.rightInt());
+            long removedEntry = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, removedEntry)) {
+                return null;
             }
-            if (removedEntry != null && ledgerMap.isEmpty()) {
+            ledgerMap.remove(entryId);
+            handleRemovePendingAck(ledgerId, entryId, stickyKeyHash(removedEntry));
+            if (ledgerMap.isEmpty()) {
                 pendingAcks.remove(ledgerId);
             }
-            return removedEntry;
+            return unpack(removedEntry);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /**
+     * Atomically remove and return the remaining unacked count for the given ledger ID and entry ID.
+     *
+     * @param ledgerId the ledger ID
+     * @param entryId the entry ID
+     * @return the remaining unacked count, or {@code -1} if not found
+     */
+    public int removeAndGetRemainingUnacked(long ledgerId, long entryId) {
+        try {
+            writeLock.lock();
+            Long2LongRBTreeMap ledgerMap = pendingAcks.get(ledgerId);
+            if (ledgerMap == null) {
+                return -1;
+            }
+            long removedEntry = ledgerMap.get(entryId);
+            if (isMissingEntry(ledgerMap, entryId, removedEntry)) {
+                return -1;
+            }
+            ledgerMap.remove(entryId);
+            handleRemovePendingAck(ledgerId, entryId, stickyKeyHash(removedEntry));
+            if (ledgerMap.isEmpty()) {
+                pendingAcks.remove(ledgerId);
+            }
+            return remainingUnacked(removedEntry);
         } finally {
             writeLock.unlock();
         }
@@ -440,30 +513,30 @@ public class PendingAcksMap {
             } else {
                 readLock.lock();
             }
-            Iterator<Map.Entry<Long, TreeMap<Long, IntIntPair>>> ledgerMapIterator =
-                    pendingAcks.headMap(markDeleteLedgerId + 1).entrySet().iterator();
+            Iterator<Long2ObjectMap.Entry<Long2LongRBTreeMap>> ledgerMapIterator =
+                    pendingAcks.headMap(markDeleteLedgerId + 1).long2ObjectEntrySet().iterator();
             while (ledgerMapIterator.hasNext()) {
-                Map.Entry<Long, TreeMap<Long, IntIntPair>> entry = ledgerMapIterator.next();
-                long ledgerId = entry.getKey();
-                TreeMap<Long, IntIntPair> ledgerMap = entry.getValue();
-                TreeMap<Long, IntIntPair> ledgerMapHead;
-                if (ledgerId == markDeleteLedgerId) {
-                    ledgerMapHead = new TreeMap<>(ledgerMap.headMap(markDeleteEntryId + 1));
-                } else {
+                Long2ObjectMap.Entry<Long2LongRBTreeMap> entry = ledgerMapIterator.next();
+                long ledgerId = entry.getLongKey();
+                Long2LongRBTreeMap ledgerMap = entry.getValue();
+                boolean removeLedger = ledgerId < markDeleteLedgerId;
+                Long2LongSortedMap ledgerMapHead;
+                if (removeLedger) {
                     ledgerMapHead = ledgerMap;
+                } else {
+                    ledgerMapHead = ledgerMap.headMap(markDeleteEntryId + 1);
                 }
-                Iterator<Map.Entry<Long, IntIntPair>> entryMapIterator =
-                        ledgerMapHead.entrySet().iterator();
+                Iterator<Long2LongMap.Entry> entryMapIterator = ledgerMapHead.long2LongEntrySet().iterator();
                 while (entryMapIterator.hasNext()) {
-                    Map.Entry<Long, IntIntPair> intIntPairEntry = entryMapIterator.next();
-                    long entryId = intIntPairEntry.getKey();
+                    Long2LongMap.Entry intIntPairEntry = entryMapIterator.next();
+                    long entryId = intIntPairEntry.getLongKey();
                     if (!acquiredWriteLock) {
                         retryWithWriteLock = true;
                         return;
                     }
-                    IntIntPair value = intIntPairEntry.getValue();
-                    int batchSize = value.leftInt();
-                    int stickyKeyHash = value.rightInt();
+                    long value = intIntPairEntry.getLongValue();
+                    int batchSize = remainingUnacked(value);
+                    int stickyKeyHash = stickyKeyHash(value);
                     if (pendingAcksRemoveHandler != null) {
                         if (!batchStarted) {
                             pendingAcksRemoveHandler.startBatch();
@@ -474,13 +547,11 @@ public class PendingAcksMap {
                     if (removedEntryCallback != null) {
                         removedEntryCallback.accept(ledgerId, entryId, batchSize, stickyKeyHash);
                     }
-                    entryMapIterator.remove();
-                    // also remove from the original map if we're iterating a copy
-                    if (ledgerId == markDeleteLedgerId) {
-                        ledgerMap.remove(entryId);
+                    if (!removeLedger) {
+                        entryMapIterator.remove();
                     }
                 }
-                if (ledgerMap.isEmpty()) {
+                if (removeLedger || ledgerMap.isEmpty()) {
                     if (!acquiredWriteLock) {
                         retryWithWriteLock = true;
                         return;
@@ -508,5 +579,31 @@ public class PendingAcksMap {
         if (pendingAcksRemoveHandler != null) {
             pendingAcksRemoveHandler.handleRemoving(consumer, ledgerId, entryId, stickyKeyHash, closed);
         }
+    }
+
+    private static long pack(int remainingUnacked, int stickyKeyHash) {
+        return ((long) remainingUnacked << Integer.SIZE) | (stickyKeyHash & 0xffffffffL);
+    }
+
+    private static Long2LongRBTreeMap newLedgerPendingAcks() {
+        Long2LongRBTreeMap ledgerPendingAcks = new Long2LongRBTreeMap();
+        ledgerPendingAcks.defaultReturnValue(PENDING_ACK_NOT_FOUND);
+        return ledgerPendingAcks;
+    }
+
+    private static boolean isMissingEntry(Long2LongRBTreeMap ledgerMap, long entryId, long pendingAck) {
+        return pendingAck == PENDING_ACK_NOT_FOUND && !ledgerMap.containsKey(entryId);
+    }
+
+    private static IntIntPair unpack(long packed) {
+        return IntIntPair.of(remainingUnacked(packed), stickyKeyHash(packed));
+    }
+
+    private static int remainingUnacked(long packed) {
+        return (int) (packed >> Integer.SIZE);
+    }
+
+    private static int stickyKeyHash(long packed) {
+        return (int) packed;
     }
 }

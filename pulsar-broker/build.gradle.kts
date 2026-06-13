@@ -84,6 +84,7 @@ dependencies {
     implementation(libs.gson)
     implementation(libs.java.semver)
     implementation(libs.avro)
+    implementation(libs.fastutil.core)
     implementation(libs.hppc)
     implementation(libs.roaringbitmap)
     implementation(libs.oshi.core)
