@@ -81,6 +81,7 @@ public class PendingAcksMapTest {
         List<Long> processedEntries = new ArrayList<>();
         pendingAcksMap.forEach((ledgerId, entryId, batchSize, stickyKeyHash) -> processedEntries.add(entryId));
 
+        processedEntries.sort(Long::compare);
         assertEquals(processedEntries, List.of(1L, 2L));
     }
 
@@ -94,6 +95,7 @@ public class PendingAcksMapTest {
         List<Long> processedEntries = new ArrayList<>();
         pendingAcksMap.forEachAndClose((ledgerId, entryId, batchSize, stickyKeyHash) -> processedEntries.add(entryId));
 
+        processedEntries.sort(Long::compare);
         assertEquals(processedEntries, List.of(1L, 2L));
         assertEquals(pendingAcksMap.size(), 0);
     }
@@ -147,6 +149,24 @@ public class PendingAcksMapTest {
     }
 
     @Test
+    public void removeAllUpTo_RemovesOnlyBoundaryLedgerPrefix() {
+        Consumer consumer = createMockConsumer("consumer1");
+        PendingAcksMap pendingAcksMap = new PendingAcksMap(consumer, () -> null, () -> null);
+        pendingAcksMap.addPendingAckIfAllowed(1L, 100L, 1, 123);
+        pendingAcksMap.addPendingAckIfAllowed(1L, 1L, 1, 124);
+        pendingAcksMap.addPendingAckIfAllowed(1L, 50L, 1, 125);
+        pendingAcksMap.addPendingAckIfAllowed(2L, 1L, 1, 126);
+
+        pendingAcksMap.removeAllUpTo(1L, 50L, (ledgerId, entryId, batchSize, stickyKeyHash) -> {
+        });
+
+        assertFalse(pendingAcksMap.contains(1L, 1L));
+        assertFalse(pendingAcksMap.contains(1L, 50L));
+        assertTrue(pendingAcksMap.contains(1L, 100L));
+        assertTrue(pendingAcksMap.contains(2L, 1L));
+    }
+
+    @Test
     public void addPendingAckIfAllowed_InvokesAddHandler() {
         Consumer consumer = createMockConsumer("consumer1");
         PendingAcksMap.PendingAcksAddHandler addHandler = mock(PendingAcksMap.PendingAcksAddHandler.class);
@@ -195,15 +215,13 @@ public class PendingAcksMapTest {
         pendingAcksMap.addPendingAckIfAllowed(1L, 2L, 5, 124);
         pendingAcksMap.addPendingAckIfAllowed(2L, 1L, 7, 125);
 
-        List<int[]> callbackInvocations = new ArrayList<>();
+        List<String> callbackInvocations = new ArrayList<>();
         pendingAcksMap.removeAllUpTo(1L, 2L,
                 (ledgerId, entryId, batchSize, stickyKeyHash) -> {
-                    callbackInvocations.add(new int[]{(int) ledgerId, (int) entryId, batchSize, stickyKeyHash});
+                    callbackInvocations.add(entry(ledgerId, entryId, batchSize, stickyKeyHash));
                 });
 
-        assertEquals(callbackInvocations.size(), 2);
-        assertEquals(callbackInvocations.get(0), new int[]{1, 1, 3, 123});
-        assertEquals(callbackInvocations.get(1), new int[]{1, 2, 5, 124});
+        assertEntries(callbackInvocations, entry(1L, 1L, 3, 123), entry(1L, 2L, 5, 124));
         assertFalse(pendingAcksMap.contains(1L, 1L));
         assertFalse(pendingAcksMap.contains(1L, 2L));
         assertTrue(pendingAcksMap.contains(2L, 1L));
@@ -230,6 +248,7 @@ public class PendingAcksMapTest {
         List<Long> processedEntries = new ArrayList<>();
         pendingAcksMap.forEachAndClear((ledgerId, entryId, batchSize, stickyKeyHash) -> processedEntries.add(entryId));
 
+        processedEntries.sort(Long::compare);
         assertEquals(processedEntries, List.of(1L, 2L));
         assertEquals(pendingAcksMap.size(), 0);
     }
@@ -345,15 +364,13 @@ public class PendingAcksMapTest {
             pendingAcksMap.addPendingAckIfAllowed(10L + i, 100L + i, values[i][0], values[i][1]);
         }
 
-        List<int[]> forEachValues = new ArrayList<>();
+        List<String> forEachValues = new ArrayList<>();
         pendingAcksMap.forEach((ledgerId, entryId, remainingUnacked, stickyKeyHash) ->
-                forEachValues.add(new int[] {
-                        (int) ledgerId, (int) entryId, remainingUnacked, stickyKeyHash
-                }));
+                forEachValues.add(entry(ledgerId, entryId, remainingUnacked, stickyKeyHash)));
         assertEquals(forEachValues.size(), values.length);
         for (int i = 0; i < values.length; i++) {
             assertPendingAck(pendingAcksMap.get(10L + i, 100L + i), values[i][0], values[i][1]);
-            assertEquals(forEachValues.get(i), new int[] {10 + i, 100 + i, values[i][0], values[i][1]});
+            assertTrue(forEachValues.contains(entry(10L + i, 100L + i, values[i][0], values[i][1])));
         }
 
         for (int i = 0; i < values.length; i++) {
@@ -381,15 +398,13 @@ public class PendingAcksMapTest {
         pendingAcksMap.addPendingAckIfAllowed(1L, 2L, 1, -1);
         pendingAcksMap.addPendingAckIfAllowed(2L, 1L, 2, Integer.MAX_VALUE);
 
-        List<int[]> callbackInvocations = new ArrayList<>();
+        List<String> callbackInvocations = new ArrayList<>();
         pendingAcksMap.removeAllUpTo(1L, 2L, (ledgerId, entryId, remainingUnacked, stickyKeyHash) ->
-                callbackInvocations.add(new int[] {
-                        (int) ledgerId, (int) entryId, remainingUnacked, stickyKeyHash
-                }));
+                callbackInvocations.add(entry(ledgerId, entryId, remainingUnacked, stickyKeyHash)));
 
-        assertEquals(callbackInvocations.size(), 2);
-        assertEquals(callbackInvocations.get(0), new int[] {1, 1, Integer.MAX_VALUE, Integer.MIN_VALUE});
-        assertEquals(callbackInvocations.get(1), new int[] {1, 2, 1, -1});
+        assertEntries(callbackInvocations,
+                entry(1L, 1L, Integer.MAX_VALUE, Integer.MIN_VALUE),
+                entry(1L, 2L, 1, -1));
         assertTrue(pendingAcksMap.contains(2L, 1L));
     }
 
@@ -408,5 +423,14 @@ public class PendingAcksMapTest {
         assertTrue(pendingAck != null);
         assertEquals(pendingAck.leftInt(), remainingUnacked);
         assertEquals(pendingAck.rightInt(), stickyKeyHash);
+    }
+
+    private static void assertEntries(List<String> actual, String... expected) {
+        assertEquals(actual.size(), expected.length);
+        assertTrue(actual.containsAll(List.of(expected)));
+    }
+
+    private static String entry(long ledgerId, long entryId, int remainingUnacked, int stickyKeyHash) {
+        return ledgerId + ":" + entryId + ":" + remainingUnacked + ":" + stickyKeyHash;
     }
 }
