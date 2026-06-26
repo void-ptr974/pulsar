@@ -29,19 +29,8 @@ public class BrokerServicePersistInternalMethodInvoker {
     }
 
     public static void ensureNoBacklogByInflightTask(PersistentReplicator replicator) {
-        Awaitility.await().atMost(20, TimeUnit.SECONDS).until(() -> {
-            synchronized (replicator.inFlightTasks) {
-                for (PersistentReplicator.InFlightTask task : replicator.inFlightTasks) {
-                    if (task.readPos.compareTo(replicator.cursor.getManagedLedger().getLastConfirmedEntry()) >= 0) {
-                        continue;
-                    }
-                    if (!task.isDone()) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        });
+        Awaitility.await().atMost(20, TimeUnit.SECONDS)
+                .until(() -> !replicator.hasUnfinishedReadBeforeLastConfirmedEntry());
     }
 
     public static Object newInFlightTaskCtx(PersistentReplicator replicator, Position readPos, int readingEntries) {
