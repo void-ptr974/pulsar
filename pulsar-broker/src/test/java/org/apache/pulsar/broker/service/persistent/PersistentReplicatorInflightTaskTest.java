@@ -188,26 +188,17 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
     public void testTryPrepareReadEntriesWithoutRateLimiterPermits(
             long availableMessages, long availableBytes) throws Exception {
         PersistentReplicator replicator = getReplicator(topicName);
-        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
-        List<InFlightTask> originalTasks = new ArrayList<>(inFlightTasks);
+        List<InFlightTask> originalTasks = drainInFlightTasks(replicator);
         Optional<DispatchRateLimiter> originalRateLimiter = replicator.dispatchRateLimiter;
 
         try {
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                replicator.dispatchRateLimiter =
-                        Optional.of(createDispatchRateLimiter(true, availableMessages, availableBytes));
-            }
+            replicator.dispatchRateLimiter =
+                    Optional.of(createDispatchRateLimiter(true, availableMessages, availableBytes));
             Assert.assertNull(replicator.tryPrepareReadEntries());
-            synchronized (inFlightTasks) {
-                Assert.assertTrue(inFlightTasks.isEmpty());
-            }
+            Assert.assertTrue(hasNoInFlightTasks(replicator));
         } finally {
-            synchronized (inFlightTasks) {
-                replicator.dispatchRateLimiter = originalRateLimiter;
-                inFlightTasks.clear();
-                inFlightTasks.addAll(originalTasks);
-            }
+            replicator.dispatchRateLimiter = originalRateLimiter;
+            setInFlightTasks(replicator, originalTasks);
         }
     }
 
@@ -216,24 +207,18 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         PersistentReplicator replicator = getReplicator(topicName);
         Awaitility.await().untilAsserted(() -> Assert.assertTrue(replicator.isConnected()));
 
-        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
-        List<InFlightTask> originalTasks = new ArrayList<>(inFlightTasks);
+        List<InFlightTask> originalTasks = drainInFlightTasks(replicator);
         Optional<DispatchRateLimiter> originalRateLimiter = replicator.dispatchRateLimiter;
         int originalWaitForCursorRewinding = replicator.waitForCursorRewindingRefCnf;
         AbstractReplicator.State originalState = replicator.getState();
 
         try {
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                replicator.dispatchRateLimiter = Optional.empty();
-            }
+            replicator.dispatchRateLimiter = Optional.empty();
 
             PreparedRead preparedRead = replicator.tryPrepareReadEntries();
             Assert.assertNotNull(preparedRead);
             Assert.assertNotNull(preparedRead.inFlightTask());
-            synchronized (inFlightTasks) {
-                Assert.assertTrue(inFlightTasks.contains(preparedRead.inFlightTask()));
-            }
+            Assert.assertTrue(containsInFlightTask(replicator, preparedRead.inFlightTask()));
             ReadLimits readLimits = preparedRead.readLimits();
             Assert.assertNotNull(readLimits);
             Assert.assertTrue(readLimits.isReadable());
@@ -241,20 +226,14 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             Assert.assertTrue(readLimits.messages() <= pulsar1.getConfig().getDispatcherMaxReadBatchSize());
             Assert.assertEquals(readLimits.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
 
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                inFlightTasks.add(new InFlightTask(PositionFactory.create(1, 1), 5, replicator.getReplicatorId()));
-            }
+            setInFlightTasks(replicator,
+                    new InFlightTask(PositionFactory.create(1, 1), 5, replicator.getReplicatorId()));
             Assert.assertNull(replicator.tryPrepareReadEntries());
 
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                replicator.waitForCursorRewindingRefCnf = 1;
-            }
+            clearInFlightTasks(replicator);
+            replicator.waitForCursorRewindingRefCnf = 1;
             Assert.assertNull(replicator.tryPrepareReadEntries());
-            synchronized (inFlightTasks) {
-                replicator.waitForCursorRewindingRefCnf = 0;
-            }
+            replicator.waitForCursorRewindingRefCnf = 0;
 
             BrokerServiceInternalMethodInvoker.replicatorSetState(replicator,
                     AbstractReplicator.State.Starting);
@@ -262,19 +241,14 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             BrokerServiceInternalMethodInvoker.replicatorSetState(replicator,
                     AbstractReplicator.State.Started);
 
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                InFlightTask fullQueueTask = new InFlightTask(PositionFactory.create(2, 2), 1000,
-                        replicator.getReplicatorId());
-                fullQueueTask.setEntries(mockEntries(1000));
-                inFlightTasks.add(fullQueueTask);
-            }
+            InFlightTask fullQueueTask = new InFlightTask(PositionFactory.create(2, 2), 1000,
+                    replicator.getReplicatorId());
+            fullQueueTask.setEntries(mockEntries(1000));
+            setInFlightTasks(replicator, fullQueueTask);
             Assert.assertNull(replicator.tryPrepareReadEntries());
 
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, 2, 128));
-            }
+            clearInFlightTasks(replicator);
+            replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, 2, 128));
             PreparedRead rateLimitedRead = replicator.tryPrepareReadEntries();
             Assert.assertNotNull(rateLimitedRead);
             ReadLimits rateLimited = rateLimitedRead.readLimits();
@@ -284,10 +258,8 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             Assert.assertTrue(rateLimited.messages() <= 2);
             Assert.assertEquals(rateLimited.bytes(), 128L);
 
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, -1, 128));
-            }
+            clearInFlightTasks(replicator);
+            replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, -1, 128));
             PreparedRead byteLimitedRead = replicator.tryPrepareReadEntries();
             Assert.assertNotNull(byteLimitedRead);
             ReadLimits byteLimited = byteLimitedRead.readLimits();
@@ -296,10 +268,8 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             Assert.assertTrue(byteLimited.messages() > 0);
             Assert.assertEquals(byteLimited.bytes(), 128L);
 
-            synchronized (inFlightTasks) {
-                inFlightTasks.clear();
-                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(false, 0, 0));
-            }
+            clearInFlightTasks(replicator);
+            replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(false, 0, 0));
             PreparedRead disabledRateLimiterRead = replicator.tryPrepareReadEntries();
             Assert.assertNotNull(disabledRateLimiterRead);
             ReadLimits disabledRateLimiter = disabledRateLimiterRead.readLimits();
@@ -308,12 +278,9 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             Assert.assertEquals(disabledRateLimiter.bytes(),
                     pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
         } finally {
-            synchronized (inFlightTasks) {
-                replicator.dispatchRateLimiter = originalRateLimiter;
-                replicator.waitForCursorRewindingRefCnf = originalWaitForCursorRewinding;
-                inFlightTasks.clear();
-                inFlightTasks.addAll(originalTasks);
-            }
+            replicator.dispatchRateLimiter = originalRateLimiter;
+            replicator.waitForCursorRewindingRefCnf = originalWaitForCursorRewinding;
+            setInFlightTasks(replicator, originalTasks);
             BrokerServiceInternalMethodInvoker.replicatorSetState(replicator, originalState);
         }
     }
@@ -333,6 +300,48 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             entries.add(mock(Entry.class));
         }
         return entries;
+    }
+
+    private List<InFlightTask> drainInFlightTasks(PersistentReplicator replicator) {
+        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
+        synchronized (inFlightTasks) {
+            List<InFlightTask> originalTasks = new ArrayList<>(inFlightTasks);
+            inFlightTasks.clear();
+            return originalTasks;
+        }
+    }
+
+    private void clearInFlightTasks(PersistentReplicator replicator) {
+        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
+        synchronized (inFlightTasks) {
+            inFlightTasks.clear();
+        }
+    }
+
+    private void setInFlightTasks(PersistentReplicator replicator, InFlightTask... tasks) {
+        setInFlightTasks(replicator, Arrays.asList(tasks));
+    }
+
+    private void setInFlightTasks(PersistentReplicator replicator, List<InFlightTask> tasks) {
+        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
+        synchronized (inFlightTasks) {
+            inFlightTasks.clear();
+            inFlightTasks.addAll(tasks);
+        }
+    }
+
+    private boolean hasNoInFlightTasks(PersistentReplicator replicator) {
+        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
+        synchronized (inFlightTasks) {
+            return inFlightTasks.isEmpty();
+        }
+    }
+
+    private boolean containsInFlightTask(PersistentReplicator replicator, InFlightTask task) {
+        LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
+        synchronized (inFlightTasks) {
+            return inFlightTasks.contains(task);
+        }
     }
 
     @Test
