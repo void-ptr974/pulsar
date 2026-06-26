@@ -22,6 +22,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 import java.util.ArrayList;
@@ -29,6 +30,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -44,6 +46,7 @@ import org.apache.pulsar.broker.service.AbstractReplicator;
 import org.apache.pulsar.broker.service.OneWayReplicatorTestBase;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.InFlightTask;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ProducerSendCallback;
+import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ReadLimits;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ReasonOfWaitForCursorRewinding;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
@@ -55,6 +58,7 @@ import org.mockito.stubbing.Answer;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 @CustomLog
@@ -168,6 +172,96 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             admin1.topics().delete(topicName, true);
             admin2.topics().delete(topicName, true);
         }
+    }
+
+    @DataProvider
+    public Object[][] rateLimiterWithoutPermits() {
+        return new Object[][] {
+                {0L, -1L},
+                {0L, 128L},
+                {-1L, 0L},
+                {2L, 0L}
+        };
+    }
+
+    @Test(dataProvider = "rateLimiterWithoutPermits")
+    public void testReadLimitsWithoutRateLimiterPermits(long availableMessages, long availableBytes) throws Exception {
+        PersistentReplicator replicator = getReplicator(topicName);
+        ReadLimits readLimits = replicator.getReadLimits(1000,
+                Optional.of(createDispatchRateLimiter(true, availableMessages, availableBytes)));
+        Assert.assertFalse(readLimits.isReadable());
+        Assert.assertEquals(readLimits.messages(), -1);
+        Assert.assertEquals(readLimits.bytes(), -1L);
+    }
+
+    @Test
+    public void testReadLimitsWithoutDispatchRateLimiter() throws Exception {
+        PersistentReplicator replicator = getReplicator(topicName);
+
+        ReadLimits noProducerPermits = replicator.getReadLimits(0, Optional.empty());
+        Assert.assertFalse(noProducerPermits.isReadable());
+        Assert.assertEquals(noProducerPermits.messages(), 0);
+        Assert.assertEquals(noProducerPermits.bytes(), 0L);
+
+        ReadLimits onePermit = replicator.getReadLimits(1, Optional.empty());
+        Assert.assertTrue(onePermit.isReadable());
+        Assert.assertEquals(onePermit.messages(), 1);
+        Assert.assertEquals(onePermit.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
+
+        ReadLimits manyPermits = replicator.getReadLimits(1000, Optional.empty());
+        Assert.assertTrue(manyPermits.isReadable());
+        Assert.assertTrue(manyPermits.messages() > 0);
+        Assert.assertTrue(manyPermits.messages() <= pulsar1.getConfig().getDispatcherMaxReadBatchSize());
+        Assert.assertEquals(manyPermits.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
+    }
+
+    @Test
+    public void testReadLimitsWithRateLimiterPermits() throws Exception {
+        PersistentReplicator replicator = getReplicator(topicName);
+
+        ReadLimits rateLimited = replicator.getReadLimits(1000,
+                Optional.of(createDispatchRateLimiter(true, 2, 128)));
+        Assert.assertTrue(rateLimited.isReadable());
+        Assert.assertEquals(rateLimited.messages(), 2);
+        Assert.assertEquals(rateLimited.bytes(), 128L);
+
+        ReadLimits messageLimited = replicator.getReadLimits(1000,
+                Optional.of(createDispatchRateLimiter(true, 2, -1)));
+        Assert.assertTrue(messageLimited.isReadable());
+        Assert.assertEquals(messageLimited.messages(), 2);
+        Assert.assertEquals(messageLimited.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
+
+        ReadLimits byteLimited = replicator.getReadLimits(1,
+                Optional.of(createDispatchRateLimiter(true, -1, 128)));
+        Assert.assertTrue(byteLimited.isReadable());
+        Assert.assertEquals(byteLimited.messages(), 1);
+        Assert.assertEquals(byteLimited.bytes(), 128L);
+
+        ReadLimits unlimitedByRateLimiter = replicator.getReadLimits(1,
+                Optional.of(createDispatchRateLimiter(true, -1, -1)));
+        Assert.assertTrue(unlimitedByRateLimiter.isReadable());
+        Assert.assertEquals(unlimitedByRateLimiter.messages(), 1);
+        Assert.assertEquals(unlimitedByRateLimiter.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
+    }
+
+    @Test
+    public void testReadLimitsWithDisabledRateLimiter() throws Exception {
+        PersistentReplicator replicator = getReplicator(topicName);
+
+        ReadLimits readLimits = replicator.getReadLimits(1,
+                Optional.of(createDispatchRateLimiter(false, 0, 0)));
+        Assert.assertTrue(readLimits.isReadable());
+        Assert.assertEquals(readLimits.messages(), 1);
+        Assert.assertEquals(readLimits.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
+    }
+
+    private DispatchRateLimiter createDispatchRateLimiter(boolean enabled, long availableMessages,
+                                                          long availableBytes) {
+        DispatchRateLimiter rateLimiter = mock(DispatchRateLimiter.class);
+        when(rateLimiter.isDispatchRateLimitingEnabled()).thenReturn(enabled);
+        when(rateLimiter.getAvailableDispatchRateLimitOnMsg()).thenReturn(availableMessages);
+        when(rateLimiter.getAvailableDispatchRateLimitOnByte()).thenReturn(availableBytes);
+        return rateLimiter;
     }
 
     @Test
