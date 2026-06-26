@@ -226,15 +226,15 @@ public abstract class PersistentReplicator extends AbstractReplicator
         }
     }
 
-    @VisibleForTesting
-    record PreparedRead(InFlightTask inFlightTask, ReadLimits readLimits) {
+    private record PreparedRead(InFlightTask inFlightTask, ReadLimits readLimits) {
     }
 
     /**
      * Calculate read limits for a read operation. Takes the rate limiter into account if it's enabled.
      * Also limits to current readBatchSize and readMaxSizeBytes.
      */
-    private ReadLimits getReadLimits(int permits, DispatchRateLimiter rateLimiter) {
+    @VisibleForTesting
+    ReadLimits getReadLimits(int permits, DispatchRateLimiter rateLimiter) {
 
         // return 0, if Producer queue is full, it will pause read entries.
         if (permits <= 0) {
@@ -898,8 +898,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
         }
     }
 
-    @VisibleForTesting
-    PreparedRead tryPrepareReadEntries() {
+    private PreparedRead tryPrepareReadEntries() {
         synchronized (inFlightTasks) {
             ReadLimits readLimits = getReadLimitsForNextRead();
             if (readLimits == null) {
