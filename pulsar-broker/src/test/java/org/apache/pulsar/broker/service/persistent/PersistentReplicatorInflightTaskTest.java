@@ -47,7 +47,6 @@ import org.apache.pulsar.broker.service.BrokerServiceInternalMethodInvoker;
 import org.apache.pulsar.broker.service.OneWayReplicatorTestBase;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.InFlightTask;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ProducerSendCallback;
-import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ReadTaskStateCallback;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ReasonOfWaitForCursorRewinding;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
@@ -87,35 +86,6 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         admin2.topics().createSubscription(topicName, subscriptionName, MessageId.earliest);
         admin1.topics().createNonPartitionedTopic(topicName);
         admin1.topics().createSubscription(topicName, subscriptionName, MessageId.earliest);
-    }
-
-    private static class ReadTaskState implements ReadTaskStateCallback {
-        private boolean readLimitsCalculated;
-        private int readPermits;
-        private int messagesToRead;
-        private long maxBytesToRead;
-        private InFlightTask createdInFlightTask;
-
-        @Override
-        public void readLimitsCalculated(int readPermits, int messagesToRead, long maxBytesToRead) {
-            this.readLimitsCalculated = true;
-            this.readPermits = readPermits;
-            this.messagesToRead = messagesToRead;
-            this.maxBytesToRead = maxBytesToRead;
-        }
-
-        @Override
-        public void inFlightTaskCreated(InFlightTask inFlightTask) {
-            this.createdInFlightTask = inFlightTask;
-        }
-
-        private void reset() {
-            readLimitsCalculated = false;
-            readPermits = 0;
-            messagesToRead = 0;
-            maxBytesToRead = 0;
-            createdInFlightTask = null;
-        }
     }
 
     @Test
@@ -227,21 +197,13 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         when(rateLimiter.getAvailableDispatchRateLimitOnMsg()).thenReturn(availableMessages);
         when(rateLimiter.getAvailableDispatchRateLimitOnByte()).thenReturn(availableBytes);
         replicator.dispatchRateLimiter = Optional.of(rateLimiter);
-        ReadTaskState readTaskState = new ReadTaskState();
-        replicator.setReadTaskStateCallback(readTaskState);
 
         try {
             Assert.assertNull(replicator.maybeCreateInFlightReadTask());
-            Assert.assertTrue(readTaskState.readLimitsCalculated);
-            Assert.assertEquals(readTaskState.readPermits, 1000);
-            Assert.assertEquals(readTaskState.messagesToRead, -1);
-            Assert.assertEquals(readTaskState.maxBytesToRead, -1L);
-            Assert.assertNull(readTaskState.createdInFlightTask);
             Assert.assertTrue(inFlightTasks.isEmpty());
             Assert.assertFalse(replicator.hasPendingRead());
             assertEquals(replicator.getPermitsIfNoPendingRead(), 1000);
         } finally {
-            replicator.setReadTaskStateCallback(null);
             inFlightTasks.clear();
             inFlightTasks.addAll(originalTasks);
             replicator.dispatchRateLimiter = originalRateLimiter;
@@ -487,8 +449,6 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         // Save original state
         int originalWaitForCursorRewinding = replicator.waitForCursorRewindingRefCnf;
         AbstractReplicator.State originalState = replicator.getState();
-        ReadTaskState readTaskState = new ReadTaskState();
-        replicator.setReadTaskStateCallback(readTaskState);
 
         try {
             // Test Case 1: Normal case - no pending read, not waiting for cursor rewinding, state is Started
@@ -496,15 +456,8 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             // First, check the current permits available
             int expectedPermits = replicator.getPermitsIfNoPendingRead();
             Assert.assertTrue(expectedPermits > 0, "Should have available permits for the test");
-            readTaskState.reset();
             InFlightTask task1 = replicator.maybeCreateInFlightReadTask();
             Assert.assertNotNull(task1, "Should return a new InFlightTask in normal case");
-            Assert.assertTrue(readTaskState.readLimitsCalculated);
-            Assert.assertEquals(readTaskState.readPermits, expectedPermits);
-            Assert.assertEquals(readTaskState.messagesToRead, 100);
-            Assert.assertEquals(readTaskState.maxBytesToRead,
-                    pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
-            Assert.assertSame(readTaskState.createdInFlightTask, task1);
             Assert.assertNotNull(task1.getReadPos(), "Task should have a read position");
             Assert.assertEquals(task1.getReadingEntries(), 100,
                     "Task readingEntries should equal to readBatchSize");
@@ -517,31 +470,22 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             InFlightTask pendingReadTask = new InFlightTask(position1, 5, "");
             // Don't set readoutEntries to simulate pending read
             inFlightTasks.add(pendingReadTask);
-            readTaskState.reset();
             InFlightTask task2 = replicator.maybeCreateInFlightReadTask();
             Assert.assertNull(task2, "Should return null when there is a pending read");
-            Assert.assertFalse(readTaskState.readLimitsCalculated);
-            Assert.assertNull(readTaskState.createdInFlightTask);
 
             // Test Case 3: With waitForCursorRewinding=true - should return null
             inFlightTasks.clear();
             replicator.waitForCursorRewindingRefCnf = 1;
-            readTaskState.reset();
             InFlightTask task3 = replicator.maybeCreateInFlightReadTask();
             Assert.assertNull(task3, "Should return null when waiting for cursor rewinding");
-            Assert.assertFalse(readTaskState.readLimitsCalculated);
-            Assert.assertNull(readTaskState.createdInFlightTask);
             // Reset for next test
             replicator.waitForCursorRewindingRefCnf = 0;
 
             // Test Case 4: With state != Started - should return null
             // We need to use reflection to modify the state since it's protected by AtomicReferenceFieldUpdater
             BrokerServiceInternalMethodInvoker.replicatorSetState(replicator, AbstractReplicator.State.Starting);
-            readTaskState.reset();
             InFlightTask task4 = replicator.maybeCreateInFlightReadTask();
             Assert.assertNull(task4, "Should return null when state is not Started");
-            Assert.assertFalse(readTaskState.readLimitsCalculated);
-            Assert.assertNull(readTaskState.createdInFlightTask);
             // Reset state for next test
             BrokerServiceInternalMethodInvoker.replicatorSetState(replicator, AbstractReplicator.State.Started);
 
@@ -563,15 +507,8 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             Assert.assertTrue(limitedPermits > 0 && limitedPermits < 20,
                     "Should have a small number of permits available for testing");
             // Now acquire permits and verify readingEntries matches the limited permits
-            readTaskState.reset();
             InFlightTask task5 = replicator.maybeCreateInFlightReadTask();
             Assert.assertNotNull(task5, "Should return a task with limited permits");
-            Assert.assertTrue(readTaskState.readLimitsCalculated);
-            Assert.assertEquals(readTaskState.readPermits, limitedPermits);
-            Assert.assertEquals(readTaskState.messagesToRead, limitedPermits);
-            Assert.assertEquals(readTaskState.maxBytesToRead,
-                    pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
-            Assert.assertSame(readTaskState.createdInFlightTask, task5);
             Assert.assertEquals(task5.getReadingEntries(), limitedPermits,
                     "Task readingEntries should equal the limited number of permits available");
 
@@ -589,14 +526,10 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
                 task.setEntries(entries);
                 inFlightTasks.add(task);
             }
-            readTaskState.reset();
             InFlightTask task6 = replicator.maybeCreateInFlightReadTask();
             Assert.assertNull(task6, "Should return null when permits is 0");
-            Assert.assertFalse(readTaskState.readLimitsCalculated);
-            Assert.assertNull(readTaskState.createdInFlightTask);
             log.info("Completed testMaybeCreateInFlightReadTask");
         } finally {
-            replicator.setReadTaskStateCallback(null);
             // Restore original state
             replicator.waitForCursorRewindingRefCnf = originalWaitForCursorRewinding;
             BrokerServiceInternalMethodInvoker.replicatorSetState(replicator, originalState);

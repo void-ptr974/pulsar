@@ -125,7 +125,6 @@ public abstract class PersistentReplicator extends AbstractReplicator
     protected ReasonOfWaitForCursorRewinding reasonOfWaitForCursorRewinding = null;
 
     protected final LinkedList<InFlightTask> inFlightTasks = new LinkedList<>();
-    private ReadTaskStateCallback readTaskStateCallback;
 
     public PersistentReplicator(String localCluster, PersistentTopic localTopic, ManagedCursor cursor,
                                 String remoteCluster, String remoteTopic,
@@ -223,15 +222,6 @@ public abstract class PersistentReplicator extends AbstractReplicator
     private record ReadLimits(int messages, long bytes) {
         public boolean isReadable() {
             return messages > 0 && bytes > 0;
-        }
-    }
-
-    @VisibleForTesting
-    interface ReadTaskStateCallback {
-        default void readLimitsCalculated(int readPermits, int messagesToRead, long maxBytesToRead) {
-        }
-
-        default void inFlightTaskCreated(InFlightTask inFlightTask) {
         }
     }
 
@@ -828,13 +818,6 @@ public abstract class PersistentReplicator extends AbstractReplicator
         return cursor;
     }
 
-    @VisibleForTesting
-    void setReadTaskStateCallback(ReadTaskStateCallback callback) {
-        synchronized (inFlightTasks) {
-            readTaskStateCallback = callback;
-        }
-    }
-
     @Data
     protected static class InFlightTask {
         Position readPos;
@@ -948,9 +931,6 @@ public abstract class PersistentReplicator extends AbstractReplicator
             }
 
             ReadLimits readLimits = getReadLimits(permits);
-            if (readTaskStateCallback != null) {
-                readTaskStateCallback.readLimitsCalculated(permits, readLimits.messages, readLimits.bytes);
-            }
 
             if (!readLimits.isReadable()) {
                 // no rate limiter permits from rate limit
@@ -961,12 +941,8 @@ public abstract class PersistentReplicator extends AbstractReplicator
                 return null;
             }
 
-            InFlightTask task = createOrRecycleInFlightTaskIntoQueue(cursor.getReadPosition(), readLimits.messages,
+            return createOrRecycleInFlightTaskIntoQueue(cursor.getReadPosition(), readLimits.messages,
                     readLimits.bytes);
-            if (readTaskStateCallback != null) {
-                readTaskStateCallback.inFlightTaskCreated(task);
-            }
-            return task;
         }
     }
 
