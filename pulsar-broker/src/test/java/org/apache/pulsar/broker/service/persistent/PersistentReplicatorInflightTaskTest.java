@@ -30,7 +30,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -188,7 +187,7 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
     public void testReadLimitsWithoutRateLimiterPermits(long availableMessages, long availableBytes) throws Exception {
         PersistentReplicator replicator = getReplicator(topicName);
         ReadLimits readLimits = replicator.getReadLimits(1000,
-                Optional.of(createDispatchRateLimiter(true, availableMessages, availableBytes)));
+                createDispatchRateLimiter(true, availableMessages, availableBytes));
         Assert.assertFalse(readLimits.isReadable());
         Assert.assertEquals(readLimits.messages(), -1);
         Assert.assertEquals(readLimits.bytes(), -1L);
@@ -198,17 +197,17 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
     public void testReadLimitsWithoutDispatchRateLimiter() throws Exception {
         PersistentReplicator replicator = getReplicator(topicName);
 
-        ReadLimits noProducerPermits = replicator.getReadLimits(0, Optional.empty());
+        ReadLimits noProducerPermits = replicator.getReadLimits(0, null);
         Assert.assertFalse(noProducerPermits.isReadable());
         Assert.assertEquals(noProducerPermits.messages(), 0);
         Assert.assertEquals(noProducerPermits.bytes(), 0L);
 
-        ReadLimits onePermit = replicator.getReadLimits(1, Optional.empty());
+        ReadLimits onePermit = replicator.getReadLimits(1, null);
         Assert.assertTrue(onePermit.isReadable());
         Assert.assertEquals(onePermit.messages(), 1);
         Assert.assertEquals(onePermit.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
 
-        ReadLimits manyPermits = replicator.getReadLimits(1000, Optional.empty());
+        ReadLimits manyPermits = replicator.getReadLimits(1000, null);
         Assert.assertTrue(manyPermits.isReadable());
         Assert.assertTrue(manyPermits.messages() > 0);
         Assert.assertTrue(manyPermits.messages() <= pulsar1.getConfig().getDispatcherMaxReadBatchSize());
@@ -220,25 +219,25 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         PersistentReplicator replicator = getReplicator(topicName);
 
         ReadLimits rateLimited = replicator.getReadLimits(1000,
-                Optional.of(createDispatchRateLimiter(true, 2, 128)));
+                createDispatchRateLimiter(true, 2, 128));
         Assert.assertTrue(rateLimited.isReadable());
         Assert.assertEquals(rateLimited.messages(), 2);
         Assert.assertEquals(rateLimited.bytes(), 128L);
 
         ReadLimits messageLimited = replicator.getReadLimits(1000,
-                Optional.of(createDispatchRateLimiter(true, 2, -1)));
+                createDispatchRateLimiter(true, 2, -1));
         Assert.assertTrue(messageLimited.isReadable());
         Assert.assertEquals(messageLimited.messages(), 2);
         Assert.assertEquals(messageLimited.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
 
         ReadLimits byteLimited = replicator.getReadLimits(1,
-                Optional.of(createDispatchRateLimiter(true, -1, 128)));
+                createDispatchRateLimiter(true, -1, 128));
         Assert.assertTrue(byteLimited.isReadable());
         Assert.assertEquals(byteLimited.messages(), 1);
         Assert.assertEquals(byteLimited.bytes(), 128L);
 
         ReadLimits unlimitedByRateLimiter = replicator.getReadLimits(1,
-                Optional.of(createDispatchRateLimiter(true, -1, -1)));
+                createDispatchRateLimiter(true, -1, -1));
         Assert.assertTrue(unlimitedByRateLimiter.isReadable());
         Assert.assertEquals(unlimitedByRateLimiter.messages(), 1);
         Assert.assertEquals(unlimitedByRateLimiter.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
@@ -249,7 +248,7 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         PersistentReplicator replicator = getReplicator(topicName);
 
         ReadLimits readLimits = replicator.getReadLimits(1,
-                Optional.of(createDispatchRateLimiter(false, 0, 0)));
+                createDispatchRateLimiter(false, 0, 0));
         Assert.assertTrue(readLimits.isReadable());
         Assert.assertEquals(readLimits.messages(), 1);
         Assert.assertEquals(readLimits.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());

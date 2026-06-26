@@ -231,7 +231,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
      * Also limits to current readBatchSize and readMaxSizeBytes.
      */
     @VisibleForTesting
-    ReadLimits getReadLimits(int permits, Optional<DispatchRateLimiter> rateLimiter) {
+    ReadLimits getReadLimits(int permits, DispatchRateLimiter rateLimiter) {
 
         // return 0, if Producer queue is full, it will pause read entries.
         if (permits <= 0) {
@@ -245,16 +245,15 @@ public abstract class PersistentReplicator extends AbstractReplicator
         long readLimitOnByte;
 
         // handle rate limit
-        if (rateLimiter.isPresent() && rateLimiter.get().isDispatchRateLimitingEnabled()) {
-            DispatchRateLimiter dispatchRateLimiter = rateLimiter.get();
+        if (rateLimiter != null && rateLimiter.isDispatchRateLimitingEnabled()) {
             // rateLimiter returns -1 if there is no rate limit configured
-            readLimitOnMsg = dispatchRateLimiter.getAvailableDispatchRateLimitOnMsg();
-            readLimitOnByte = dispatchRateLimiter.getAvailableDispatchRateLimitOnByte();
+            readLimitOnMsg = rateLimiter.getAvailableDispatchRateLimitOnMsg();
+            readLimitOnByte = rateLimiter.getAvailableDispatchRateLimitOnByte();
             // no permits from rate limit when either limit is 0
             if (readLimitOnByte == 0 || readLimitOnMsg == 0) {
                 log.debug()
-                        .attr("dispatchRateOnMsg", dispatchRateLimiter.getDispatchRateOnMsg())
-                        .attr("dispatchRateOnByte", dispatchRateLimiter.getDispatchRateOnByte())
+                        .attr("dispatchRateOnMsg", rateLimiter.getDispatchRateOnMsg())
+                        .attr("dispatchRateOnByte", rateLimiter.getDispatchRateOnByte())
                         .attr("readLimitOnMsg", readLimitOnMsg)
                         .attr("readLimitOnByte", readLimitOnByte)
                         .log("Message-read exceeded topic replicator rate limit");
@@ -927,7 +926,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
             permits = 1;
         }
 
-        ReadLimits readLimits = getReadLimits(permits, dispatchRateLimiter);
+        ReadLimits readLimits = getReadLimits(permits, dispatchRateLimiter.orElse(null));
 
         if (!readLimits.isReadable()) {
             // no rate limiter permits from rate limit
