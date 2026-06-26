@@ -226,6 +226,10 @@ public abstract class PersistentReplicator extends AbstractReplicator
         }
     }
 
+    @VisibleForTesting
+    record PreparedRead(InFlightTask inFlightTask, ReadLimits readLimits) {
+    }
+
     /**
      * Calculate read limits for a read operation. Takes the rate limiter into account if it's enabled.
      * Also limits to current readBatchSize and readMaxSizeBytes.
@@ -301,15 +305,8 @@ public abstract class PersistentReplicator extends AbstractReplicator
         if (state.equals(Terminated) || state.equals(Terminating)) {
             return;
         }
-        InFlightTask newInFlightTask = null;
-        ReadLimits readLimits = null;
-        synchronized (inFlightTasks) {
-            readLimits = maybeGetReadLimitsForNextReadInLock();
-            if (readLimits != null) {
-                newInFlightTask = createOrRecycleInFlightTaskIntoQueue(cursor.getReadPosition(), readLimits.messages);
-            }
-        }
-        if (newInFlightTask == null) {
+        PreparedRead preparedRead = tryPrepareReadEntries();
+        if (preparedRead == null) {
             log.debug("Not scheduling read due to pending read or no permits");
             if (!hasPendingRead()) {
                 topic.getBrokerService().executor().schedule(
@@ -318,10 +315,10 @@ public abstract class PersistentReplicator extends AbstractReplicator
             return;
         }
         log.debug()
-                .attr("readingEntries", newInFlightTask.readingEntries)
+                .attr("readingEntries", preparedRead.inFlightTask.readingEntries)
                 .log("Scheduling read");
-        cursor.asyncReadEntriesOrWait(newInFlightTask.readingEntries, readLimits.bytes, this,
-                newInFlightTask/* Context object */, topic.getMaxReadPosition());
+        cursor.asyncReadEntriesOrWait(preparedRead.inFlightTask.readingEntries, preparedRead.readLimits.bytes, this,
+                preparedRead.inFlightTask/* Context object */, topic.getMaxReadPosition());
     }
 
     @Override
@@ -902,7 +899,19 @@ public abstract class PersistentReplicator extends AbstractReplicator
     }
 
     @VisibleForTesting
-    ReadLimits maybeGetReadLimitsForNextReadInLock() {
+    PreparedRead tryPrepareReadEntries() {
+        synchronized (inFlightTasks) {
+            ReadLimits readLimits = getReadLimitsForNextRead();
+            if (readLimits == null) {
+                return null;
+            }
+            InFlightTask inFlightTask =
+                    createOrRecycleInFlightTaskIntoQueue(cursor.getReadPosition(), readLimits.messages);
+            return new PreparedRead(inFlightTask, readLimits);
+        }
+    }
+
+    private ReadLimits getReadLimitsForNextRead() {
         if (hasPendingRead()) {
             log.info("Skip the reading because there is a pending read task");
             return null;

@@ -46,6 +46,7 @@ import org.apache.pulsar.broker.service.AbstractReplicator;
 import org.apache.pulsar.broker.service.BrokerServiceInternalMethodInvoker;
 import org.apache.pulsar.broker.service.OneWayReplicatorTestBase;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.InFlightTask;
+import org.apache.pulsar.broker.service.persistent.PersistentReplicator.PreparedRead;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ProducerSendCallback;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ReadLimits;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator.ReasonOfWaitForCursorRewinding;
@@ -184,7 +185,7 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
     }
 
     @Test(dataProvider = "rateLimiterWithoutPermits")
-    public void testMaybeGetReadLimitsForNextReadWithoutRateLimiterPermits(
+    public void testTryPrepareReadEntriesWithoutRateLimiterPermits(
             long availableMessages, long availableBytes) throws Exception {
         PersistentReplicator replicator = getReplicator(topicName);
         LinkedList<InFlightTask> inFlightTasks = replicator.inFlightTasks;
@@ -196,8 +197,9 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
                 inFlightTasks.clear();
                 replicator.dispatchRateLimiter =
                         Optional.of(createDispatchRateLimiter(true, availableMessages, availableBytes));
-
-                Assert.assertNull(replicator.maybeGetReadLimitsForNextReadInLock());
+            }
+            Assert.assertNull(replicator.tryPrepareReadEntries());
+            synchronized (inFlightTasks) {
                 Assert.assertTrue(inFlightTasks.isEmpty());
             }
         } finally {
@@ -210,7 +212,7 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
     }
 
     @Test
-    public void testMaybeGetReadLimitsForNextReadInLock() throws Exception {
+    public void testTryPrepareReadEntries() throws Exception {
         PersistentReplicator replicator = getReplicator(topicName);
         Awaitility.await().untilAsserted(() -> Assert.assertTrue(replicator.isConnected()));
 
@@ -224,58 +226,87 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
             synchronized (inFlightTasks) {
                 inFlightTasks.clear();
                 replicator.dispatchRateLimiter = Optional.empty();
+            }
 
-                ReadLimits readLimits = replicator.maybeGetReadLimitsForNextReadInLock();
-                Assert.assertNotNull(readLimits);
-                Assert.assertTrue(readLimits.isReadable());
-                Assert.assertTrue(readLimits.messages() > 0);
-                Assert.assertTrue(readLimits.messages() <= pulsar1.getConfig().getDispatcherMaxReadBatchSize());
-                Assert.assertEquals(readLimits.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
+            PreparedRead preparedRead = replicator.tryPrepareReadEntries();
+            Assert.assertNotNull(preparedRead);
+            Assert.assertNotNull(preparedRead.inFlightTask());
+            synchronized (inFlightTasks) {
+                Assert.assertTrue(inFlightTasks.contains(preparedRead.inFlightTask()));
+            }
+            ReadLimits readLimits = preparedRead.readLimits();
+            Assert.assertNotNull(readLimits);
+            Assert.assertTrue(readLimits.isReadable());
+            Assert.assertTrue(readLimits.messages() > 0);
+            Assert.assertTrue(readLimits.messages() <= pulsar1.getConfig().getDispatcherMaxReadBatchSize());
+            Assert.assertEquals(readLimits.bytes(), pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
 
+            synchronized (inFlightTasks) {
+                inFlightTasks.clear();
                 inFlightTasks.add(new InFlightTask(PositionFactory.create(1, 1), 5, replicator.getReplicatorId()));
-                Assert.assertNull(replicator.maybeGetReadLimitsForNextReadInLock());
+            }
+            Assert.assertNull(replicator.tryPrepareReadEntries());
 
+            synchronized (inFlightTasks) {
                 inFlightTasks.clear();
                 replicator.waitForCursorRewindingRefCnf = 1;
-                Assert.assertNull(replicator.maybeGetReadLimitsForNextReadInLock());
+            }
+            Assert.assertNull(replicator.tryPrepareReadEntries());
+            synchronized (inFlightTasks) {
                 replicator.waitForCursorRewindingRefCnf = 0;
+            }
 
-                BrokerServiceInternalMethodInvoker.replicatorSetState(replicator,
-                        AbstractReplicator.State.Starting);
-                Assert.assertNull(replicator.maybeGetReadLimitsForNextReadInLock());
-                BrokerServiceInternalMethodInvoker.replicatorSetState(replicator,
-                        AbstractReplicator.State.Started);
+            BrokerServiceInternalMethodInvoker.replicatorSetState(replicator,
+                    AbstractReplicator.State.Starting);
+            Assert.assertNull(replicator.tryPrepareReadEntries());
+            BrokerServiceInternalMethodInvoker.replicatorSetState(replicator,
+                    AbstractReplicator.State.Started);
 
+            synchronized (inFlightTasks) {
                 inFlightTasks.clear();
                 InFlightTask fullQueueTask = new InFlightTask(PositionFactory.create(2, 2), 1000,
                         replicator.getReplicatorId());
                 fullQueueTask.setEntries(mockEntries(1000));
                 inFlightTasks.add(fullQueueTask);
-                Assert.assertNull(replicator.maybeGetReadLimitsForNextReadInLock());
+            }
+            Assert.assertNull(replicator.tryPrepareReadEntries());
 
+            synchronized (inFlightTasks) {
                 inFlightTasks.clear();
                 replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, 2, 128));
-                ReadLimits rateLimited = replicator.maybeGetReadLimitsForNextReadInLock();
-                Assert.assertNotNull(rateLimited);
-                Assert.assertTrue(rateLimited.isReadable());
-                Assert.assertTrue(rateLimited.messages() > 0);
-                Assert.assertTrue(rateLimited.messages() <= 2);
-                Assert.assertEquals(rateLimited.bytes(), 128L);
-
-                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, -1, 128));
-                ReadLimits byteLimited = replicator.maybeGetReadLimitsForNextReadInLock();
-                Assert.assertNotNull(byteLimited);
-                Assert.assertTrue(byteLimited.isReadable());
-                Assert.assertTrue(byteLimited.messages() > 0);
-                Assert.assertEquals(byteLimited.bytes(), 128L);
-
-                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(false, 0, 0));
-                ReadLimits disabledRateLimiter = replicator.maybeGetReadLimitsForNextReadInLock();
-                Assert.assertNotNull(disabledRateLimiter);
-                Assert.assertTrue(disabledRateLimiter.isReadable());
-                Assert.assertEquals(disabledRateLimiter.bytes(),
-                        pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
             }
+            PreparedRead rateLimitedRead = replicator.tryPrepareReadEntries();
+            Assert.assertNotNull(rateLimitedRead);
+            ReadLimits rateLimited = rateLimitedRead.readLimits();
+            Assert.assertNotNull(rateLimited);
+            Assert.assertTrue(rateLimited.isReadable());
+            Assert.assertTrue(rateLimited.messages() > 0);
+            Assert.assertTrue(rateLimited.messages() <= 2);
+            Assert.assertEquals(rateLimited.bytes(), 128L);
+
+            synchronized (inFlightTasks) {
+                inFlightTasks.clear();
+                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(true, -1, 128));
+            }
+            PreparedRead byteLimitedRead = replicator.tryPrepareReadEntries();
+            Assert.assertNotNull(byteLimitedRead);
+            ReadLimits byteLimited = byteLimitedRead.readLimits();
+            Assert.assertNotNull(byteLimited);
+            Assert.assertTrue(byteLimited.isReadable());
+            Assert.assertTrue(byteLimited.messages() > 0);
+            Assert.assertEquals(byteLimited.bytes(), 128L);
+
+            synchronized (inFlightTasks) {
+                inFlightTasks.clear();
+                replicator.dispatchRateLimiter = Optional.of(createDispatchRateLimiter(false, 0, 0));
+            }
+            PreparedRead disabledRateLimiterRead = replicator.tryPrepareReadEntries();
+            Assert.assertNotNull(disabledRateLimiterRead);
+            ReadLimits disabledRateLimiter = disabledRateLimiterRead.readLimits();
+            Assert.assertNotNull(disabledRateLimiter);
+            Assert.assertTrue(disabledRateLimiter.isReadable());
+            Assert.assertEquals(disabledRateLimiter.bytes(),
+                    pulsar1.getConfig().getDispatcherMaxReadSizeBytes());
         } finally {
             synchronized (inFlightTasks) {
                 replicator.dispatchRateLimiter = originalRateLimiter;
