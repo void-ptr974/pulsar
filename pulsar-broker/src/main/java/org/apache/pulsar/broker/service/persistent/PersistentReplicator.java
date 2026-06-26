@@ -230,8 +230,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
      * Calculate read limits for a read operation. Takes the rate limiter into account if it's enabled.
      * Also limits to current readBatchSize and readMaxSizeBytes.
      */
-    @VisibleForTesting
-    ReadLimits getReadLimits(int permits, DispatchRateLimiter rateLimiter) {
+    private ReadLimits getReadLimits(int permits, DispatchRateLimiter rateLimiter) {
 
         // return 0, if Producer queue is full, it will pause read entries.
         if (permits <= 0) {
@@ -902,7 +901,8 @@ public abstract class PersistentReplicator extends AbstractReplicator
         }
     }
 
-    private ReadLimits maybeGetReadLimitsForNextReadInLock() {
+    @VisibleForTesting
+    ReadLimits maybeGetReadLimitsForNextReadInLock() {
         if (hasPendingRead()) {
             log.info("Skip the reading because there is a pending read task");
             return null;
