@@ -19,6 +19,7 @@
 package org.apache.pulsar.broker.service;
 
 import static org.apache.pulsar.broker.service.StickyKeyConsumerSelector.STICKY_KEY_HASH_NOT_SET;
+import com.google.common.annotations.VisibleForTesting;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -49,7 +50,7 @@ public class DrainingHashesTracker {
     private final UnblockingHandler unblockingHandler;
     // optimize the memory consumption of the map by using primitive int keys
     private final Int2ObjectOpenHashMap<DrainingHashEntry> drainingHashes = new Int2ObjectOpenHashMap<>();
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock lock;
     int batchLevel;
     boolean unblockedWhileBatching;
     private final Map<ConsumerIdentityWrapper, ConsumerDrainingHashesStats> consumerDrainingHashesStatsMap =
@@ -241,8 +242,14 @@ public class DrainingHashesTracker {
     }
 
     public DrainingHashesTracker(String dispatcherName, UnblockingHandler unblockingHandler) {
+        this(dispatcherName, unblockingHandler, new ReentrantReadWriteLock());
+    }
+
+    @VisibleForTesting
+    DrainingHashesTracker(String dispatcherName, UnblockingHandler unblockingHandler, ReentrantReadWriteLock lock) {
         this.dispatcherName = dispatcherName;
         this.unblockingHandler = unblockingHandler;
+        this.lock = lock;
     }
 
     /**

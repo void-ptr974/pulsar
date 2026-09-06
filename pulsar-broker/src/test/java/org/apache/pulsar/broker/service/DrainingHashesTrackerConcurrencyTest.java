@@ -31,6 +31,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.pulsar.broker.service.DrainingHashesTracker.DrainingHashEntry;
 import org.apache.pulsar.broker.service.DrainingHashesTracker.UnblockingHandler;
 import org.apache.pulsar.common.policies.data.stats.ConsumerStatsImpl;
@@ -43,6 +44,119 @@ import org.testng.annotations.Test;
  */
 public class DrainingHashesTrackerConcurrencyTest {
     @Test(timeOut = 30000)
+    public void newlyPublishedEntryShouldAlreadyHaveItsFirstReference() throws Exception {
+        Consumer owner = createMockConsumer("owner");
+        UnblockingHandler handler = mock(UnblockingHandler.class);
+        PausingReadWriteLock lock = new PausingReadWriteLock();
+        DrainingHashesTracker tracker = new DrainingHashesTracker("dispatcher", handler, lock);
+        int hash = 1;
+        OperationPause pause = lock.pauseNextWriteUnlock();
+        ExecutorService executor = newExecutor();
+        try {
+            Future<?> addition = executor.submit(() -> tracker.addEntry(owner, hash));
+            pause.awaitCaptured();
+
+            // The map is now readable, but addEntry has not returned from writeLock().unlock().
+            // Moving the increment outside the lock would publish an entry with zero references.
+            DrainingHashEntry entry = tracker.getEntry(hash);
+            assertThat(entry).isNotNull();
+            assertThat(entry.getRefCount()).isEqualTo(1);
+            pause.resume();
+            addition.get(10, TimeUnit.SECONDS);
+            assertStats(tracker, owner, 1, 0, 1);
+
+            tracker.reduceRefCount(owner, hash, false);
+            assertThat(entry.getRefCount()).isZero();
+            assertThat(tracker.getEntry(hash)).isNull();
+            assertStats(tracker, owner, 0, 1, 0);
+            verifyNoInteractions(handler);
+        } finally {
+            pause.resume();
+            shutdown(executor);
+        }
+    }
+
+    @Test(timeOut = 30000)
+    public void addedReferenceShouldSurviveAckAfterWriteUnlock() throws Exception {
+        Consumer owner = createMockConsumer("owner");
+        Consumer other = createMockConsumer("other");
+        UnblockingHandler handler = mock(UnblockingHandler.class);
+        PausingReadWriteLock lock = new PausingReadWriteLock();
+        DrainingHashesTracker tracker = new DrainingHashesTracker("dispatcher", handler, lock);
+        int hash = 1;
+        tracker.addEntry(owner, hash);
+        DrainingHashEntry entry = tracker.getEntry(hash);
+        assertThat(tracker.shouldBlockStickyKeyHash(other, hash)).isTrue();
+
+        OperationPause pause = lock.pauseNextWriteUnlock();
+        ExecutorService executor = newExecutor();
+        try {
+            Future<?> addition = executor.submit(() -> tracker.addEntry(owner, hash));
+            pause.awaitCaptured();
+            // ACK while addEntry is still returning from unlock. The new reference must already be counted.
+            tracker.reduceRefCount(owner, hash, false);
+            pause.resume();
+            addition.get(10, TimeUnit.SECONDS);
+
+            assertThat(tracker.getEntry(hash)).isSameAs(entry);
+            assertThat(entry.getRefCount()).isEqualTo(1);
+            assertStats(tracker, owner, 1, 0, 1);
+            verifyNoInteractions(handler);
+
+            tracker.reduceRefCount(owner, hash, false);
+            assertThat(entry.getRefCount()).isZero();
+            assertThat(tracker.getEntry(hash)).isNull();
+            assertStats(tracker, owner, 0, 1, 0);
+            verify(handler).stickyKeyHashUnblocked(hash);
+            verifyNoMoreInteractions(handler);
+        } finally {
+            pause.resume();
+            shutdown(executor);
+        }
+    }
+
+    @Test(timeOut = 30000)
+    public void slowPathAckShouldPreserveReferenceAddedBeforeWriteLock() throws Exception {
+        Consumer owner = createMockConsumer("owner");
+        Consumer other = createMockConsumer("other");
+        UnblockingHandler handler = mock(UnblockingHandler.class);
+        PausingReadWriteLock lock = new PausingReadWriteLock();
+        DrainingHashesTracker tracker = new DrainingHashesTracker("dispatcher", handler, lock);
+        int hash = 1;
+        tracker.addEntry(owner, hash);
+        DrainingHashEntry entry = tracker.getEntry(hash);
+        assertThat(tracker.shouldBlockStickyKeyHash(other, hash)).isTrue();
+
+        OperationPause pause = lock.pauseNextWriteLock();
+        ExecutorService executor = newExecutor();
+        try {
+            Future<?> ack = executor.submit(() -> tracker.reduceRefCount(owner, hash, false));
+            pause.awaitCaptured();
+            // The fast path observed one reference and declined to decrement it, but the ACK has not locked yet.
+            assertThat(entry.getRefCount()).isEqualTo(1);
+            tracker.addEntry(owner, hash);
+            assertThat(entry.getRefCount()).isEqualTo(2);
+            pause.resume();
+            ack.get(10, TimeUnit.SECONDS);
+
+            assertThat(tracker.getEntry(hash)).isSameAs(entry);
+            assertThat(entry.getRefCount()).isEqualTo(1);
+            assertStats(tracker, owner, 1, 0, 1);
+            verifyNoInteractions(handler);
+
+            tracker.reduceRefCount(owner, hash, false);
+            assertThat(entry.getRefCount()).isZero();
+            assertThat(tracker.getEntry(hash)).isNull();
+            assertStats(tracker, owner, 0, 1, 0);
+            verify(handler).stickyKeyHashUnblocked(hash);
+            verifyNoMoreInteractions(handler);
+        } finally {
+            pause.resume();
+            shutdown(executor);
+        }
+    }
+
+    @Test(timeOut = 30000)
     public void lastAckShouldCompleteWhenOwnerReclaimsHash() throws Exception {
         Consumer owner = createMockConsumer("owner");
         Consumer other = createMockConsumer("other");
@@ -54,7 +168,7 @@ public class DrainingHashesTrackerConcurrencyTest {
         assertThat(entry.getRefCount()).isEqualTo(1);
         assertThat(tracker.shouldBlockStickyKeyHash(other, hash)).isTrue();
 
-        LookupPause pause = tracker.pauseNextLookup();
+        OperationPause pause = tracker.pauseNextLookup();
         ExecutorService executor = newExecutor();
         try {
             Future<?> ack = executor.submit(() -> tracker.reduceRefCount(owner, hash, false));
@@ -86,7 +200,7 @@ public class DrainingHashesTrackerConcurrencyTest {
         tracker.addEntry(owner, hash);
         assertThat(tracker.shouldBlockStickyKeyHash(other, hash)).isTrue();
 
-        LookupPause pause = tracker.pauseNextLookup();
+        OperationPause pause = tracker.pauseNextLookup();
         ExecutorService executor = newExecutor();
         try {
             Future<Boolean> reassignment = executor.submit(() -> tracker.shouldBlockStickyKeyHash(owner, hash));
@@ -121,7 +235,7 @@ public class DrainingHashesTrackerConcurrencyTest {
         tracker.addEntry(owner, hash);
         DrainingHashEntry oldEntry = tracker.getEntry(hash);
 
-        LookupPause pause = tracker.pauseNextLookup();
+        OperationPause pause = tracker.pauseNextLookup();
         ExecutorService executor = newExecutor();
         try {
             Future<?> ack = executor.submit(() -> tracker.reduceRefCount(owner, hash, false));
@@ -160,7 +274,7 @@ public class DrainingHashesTrackerConcurrencyTest {
         DrainingHashEntry oldEntry = tracker.getEntry(hash);
         assertThat(oldEntry.getRefCount()).isEqualTo(2);
 
-        LookupPause pause = tracker.pauseNextLookup();
+        OperationPause pause = tracker.pauseNextLookup();
         ExecutorService executor = newExecutor();
         try {
             Future<?> ack = executor.submit(() -> tracker.reduceRefCount(owner, hash, false));
@@ -187,8 +301,13 @@ public class DrainingHashesTrackerConcurrencyTest {
         }
     }
 
-    @Test(timeOut = 30000)
-    public void concurrentReductionsShouldRemoveAndNotifyOnce() throws Exception {
+    @DataProvider(name = "removalModes")
+    public Object[][] removalModes() {
+        return new Object[][] {{false, false}, {true, false}, {false, true}, {true, true}};
+    }
+
+    @Test(dataProvider = "removalModes", timeOut = 30000)
+    public void concurrentReductionsShouldRemoveAndNotifyOnce(boolean batching, boolean closing) throws Exception {
         Consumer owner = createMockConsumer("owner");
         Consumer other = createMockConsumer("other");
         UnblockingHandler handler = mock(UnblockingHandler.class);
@@ -202,6 +321,11 @@ public class DrainingHashesTrackerConcurrencyTest {
         DrainingHashEntry entry = tracker.getEntry(hash);
         assertThat(tracker.shouldBlockStickyKeyHash(other, hash)).isTrue();
 
+        if (batching) {
+            tracker.startBatch();
+            tracker.startBatch();
+        }
+
         ExecutorService executor = newExecutor(workerCount);
         CountDownLatch start = new CountDownLatch(1);
         Future<?>[] workers = new Future<?>[workerCount];
@@ -210,7 +334,7 @@ public class DrainingHashesTrackerConcurrencyTest {
                 workers[i] = executor.submit(() -> {
                     await(start);
                     for (int j = 0; j < reductionsPerWorker; j++) {
-                        tracker.reduceRefCount(owner, hash, false);
+                        tracker.reduceRefCount(owner, hash, closing);
                     }
                 });
             }
@@ -222,16 +346,15 @@ public class DrainingHashesTrackerConcurrencyTest {
             assertThat(entry.getRefCount()).isZero();
             assertThat(tracker.getEntry(hash)).isNull();
             assertStats(tracker, owner, 0, 1, 0);
-            verify(handler).stickyKeyHashUnblocked(hash);
-            verifyNoMoreInteractions(handler);
+            assertUnblocking(tracker, handler, hash, batching, closing);
         } finally {
             start.countDown();
             shutdown(executor);
         }
     }
 
-    @Test(timeOut = 30000)
-    public void twoCapturedLastAcksShouldOnlyRemoveAndNotifyOnce() throws Exception {
+    @Test(dataProvider = "removalModes", timeOut = 30000)
+    public void twoCapturedLastAcksShouldOnlyRemoveAndNotifyOnce(boolean batching, boolean closing) throws Exception {
         Consumer owner = createMockConsumer("owner");
         Consumer other = createMockConsumer("other");
         UnblockingHandler handler = mock(UnblockingHandler.class);
@@ -241,14 +364,19 @@ public class DrainingHashesTrackerConcurrencyTest {
         DrainingHashEntry entry = tracker.getEntry(hash);
         assertThat(tracker.shouldBlockStickyKeyHash(other, hash)).isTrue();
 
-        LookupPause firstPause = tracker.pauseNextLookup();
-        LookupPause secondPause = null;
+        if (batching) {
+            tracker.startBatch();
+            tracker.startBatch();
+        }
+
+        OperationPause firstPause = tracker.pauseNextLookup();
+        OperationPause secondPause = null;
         ExecutorService executor = newExecutor();
         try {
-            Future<?> firstAck = executor.submit(() -> tracker.reduceRefCount(owner, hash, false));
+            Future<?> firstAck = executor.submit(() -> tracker.reduceRefCount(owner, hash, closing));
             firstPause.awaitCaptured();
             secondPause = tracker.pauseNextLookup();
-            Future<?> secondAck = executor.submit(() -> tracker.reduceRefCount(owner, hash, false));
+            Future<?> secondAck = executor.submit(() -> tracker.reduceRefCount(owner, hash, closing));
             secondPause.awaitCaptured();
             firstPause.resume();
             firstAck.get(10, TimeUnit.SECONDS);
@@ -258,14 +386,29 @@ public class DrainingHashesTrackerConcurrencyTest {
             assertThat(entry.getRefCount()).isZero();
             assertThat(tracker.getEntry(hash)).isNull();
             assertStats(tracker, owner, 0, 1, 0);
-            verify(handler).stickyKeyHashUnblocked(hash);
-            verifyNoMoreInteractions(handler);
+            assertUnblocking(tracker, handler, hash, batching, closing);
         } finally {
             firstPause.resume();
             if (secondPause != null) {
                 secondPause.resume();
             }
             shutdown(executor);
+        }
+    }
+
+    private static void assertUnblocking(DrainingHashesTracker tracker, UnblockingHandler handler,
+                                         int hash, boolean batching, boolean closing) {
+        if (batching) {
+            verifyNoInteractions(handler);
+            tracker.endBatch();
+            verifyNoInteractions(handler);
+            tracker.endBatch();
+        }
+        if (closing) {
+            verifyNoInteractions(handler);
+        } else {
+            verify(handler).stickyKeyHashUnblocked(batching ? -1 : hash);
+            verifyNoMoreInteractions(handler);
         }
     }
 
@@ -301,14 +444,14 @@ public class DrainingHashesTrackerConcurrencyTest {
     }
 
     private static class PausingTracker extends DrainingHashesTracker {
-        private final AtomicReference<LookupPause> nextPause = new AtomicReference<>();
+        private final AtomicReference<OperationPause> nextPause = new AtomicReference<>();
 
         PausingTracker(UnblockingHandler handler) {
             super("dispatcher", handler);
         }
 
-        LookupPause pauseNextLookup() {
-            LookupPause pause = new LookupPause();
+        OperationPause pauseNextLookup() {
+            OperationPause pause = new OperationPause();
             assertThat(nextPause.compareAndSet(null, pause)).as("Previous lookup pause must be consumed").isTrue();
             return pause;
         }
@@ -316,26 +459,69 @@ public class DrainingHashesTrackerConcurrencyTest {
         @Override
         public DrainingHashEntry getEntry(int stickyKeyHash) {
             DrainingHashEntry entry = super.getEntry(stickyKeyHash);
-            LookupPause pause = nextPause.getAndSet(null);
-            if (pause != null) {
-                pause.captured.countDown();
-                try {
-                    assertThat(pause.resumed.await(10, TimeUnit.SECONDS)).as("Paused lookup must resume").isTrue();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new AssertionError("Interrupted while waiting to resume lookup", e);
-                }
-            }
+            pauseIfRequested(nextPause);
             return entry;
         }
     }
 
-    private static class LookupPause {
+    private static class PausingReadWriteLock extends ReentrantReadWriteLock {
+        private final AtomicReference<OperationPause> nextWriteLockPause = new AtomicReference<>();
+        private final AtomicReference<OperationPause> nextWriteUnlockPause = new AtomicReference<>();
+        private final WriteLock pausingWriteLock = new WriteLock(this) {
+            @Override
+            public void lock() {
+                pauseIfRequested(nextWriteLockPause);
+                super.lock();
+            }
+
+            @Override
+            public void unlock() {
+                super.unlock();
+                pauseIfRequested(nextWriteUnlockPause);
+            }
+        };
+
+        @Override
+        public WriteLock writeLock() {
+            return pausingWriteLock;
+        }
+
+        OperationPause pauseNextWriteLock() {
+            OperationPause pause = new OperationPause();
+            assertThat(nextWriteLockPause.compareAndSet(null, pause)).isTrue();
+            return pause;
+        }
+
+        OperationPause pauseNextWriteUnlock() {
+            OperationPause pause = new OperationPause();
+            assertThat(nextWriteUnlockPause.compareAndSet(null, pause)).isTrue();
+            return pause;
+        }
+    }
+
+    private static void pauseIfRequested(AtomicReference<OperationPause> nextPause) {
+        OperationPause pause = nextPause.getAndSet(null);
+        if (pause != null) {
+            pause.pause();
+        }
+    }
+
+    private static class OperationPause {
         private final CountDownLatch captured = new CountDownLatch(1);
         private final CountDownLatch resumed = new CountDownLatch(1);
 
         void awaitCaptured() throws InterruptedException {
-            assertThat(captured.await(10, TimeUnit.SECONDS)).as("Worker must capture the real entry").isTrue();
+            assertThat(captured.await(10, TimeUnit.SECONDS)).as("Worker must reach the pause").isTrue();
+        }
+
+        void pause() {
+            captured.countDown();
+            try {
+                assertThat(resumed.await(10, TimeUnit.SECONDS)).as("Paused operation must resume").isTrue();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Interrupted while waiting to resume operation", e);
+            }
         }
 
         void resume() {
