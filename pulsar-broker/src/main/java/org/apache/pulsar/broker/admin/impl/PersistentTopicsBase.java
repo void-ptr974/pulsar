@@ -5591,17 +5591,20 @@ public class PersistentTopicsBase extends AdminResource {
                         });
     }
 
-    @SuppressWarnings("deprecation")
     protected CompletableFuture<Boolean> internalGetSchemaValidationEnforced(boolean applied) {
-        // Schema validation enforced is typically a local policy
         return getTopicPoliciesAsyncWithRetry(topicName)
-                .thenApply(op -> op.map(TopicPolicies::getSchemaValidationEnforced).orElseGet(() -> {
-                    if (applied) {
-                        boolean namespacePolicy = getNamespacePolicies(namespaceName).schema_validation_enforced;
-                        return namespacePolicy || pulsar().getConfiguration().isSchemaValidationEnforced();
+                .thenCompose(op -> {
+                    Boolean topicPolicy = op.map(TopicPolicies::getSchemaValidationEnforced).orElse(null);
+                    boolean brokerPolicy = pulsar().getConfiguration().isSchemaValidationEnforced();
+                    if (topicPolicy != null) {
+                        return CompletableFuture.completedFuture(applied ? topicPolicy || brokerPolicy : topicPolicy);
                     }
-                    return false; // Default if not set and not applied
-                }));
+                    if (!applied) {
+                        return CompletableFuture.completedFuture(false);
+                    }
+                    return getNamespacePoliciesAsync(namespaceName)
+                            .thenApply(policies -> policies.schema_validation_enforced || brokerPolicy);
+                });
     }
 
     protected CompletableFuture<Void> internalSetSchemaValidationEnforced(boolean schemaValidationEnforcedToSet) {
