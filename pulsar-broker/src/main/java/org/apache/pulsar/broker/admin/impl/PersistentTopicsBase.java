@@ -3798,9 +3798,23 @@ public class PersistentTopicsBase extends AdminResource {
     protected CompletableFuture<Boolean> internalGetDispatcherPauseOnAckStatePersistent(boolean applied,
                                                                                         boolean isGlobal) {
         return getTopicPoliciesAsyncWithRetry(topicName, isGlobal)
-            .thenApply(op -> op.map(TopicPolicies::getDispatcherPauseOnAckStatePersistentEnabled)
-                .orElse(false));
-}
+            .thenCompose(op -> {
+                Boolean topicPolicy = op.map(TopicPolicies::getDispatcherPauseOnAckStatePersistentEnabled)
+                        .orElse(null);
+                if (topicPolicy != null) {
+                    return CompletableFuture.completedFuture(topicPolicy);
+                }
+                if (!applied) {
+                    return CompletableFuture.completedFuture(false);
+                }
+                return getNamespacePoliciesAsync(namespaceName).thenApply(namespacePolicies -> {
+                    Boolean namespacePolicy = namespacePolicies.dispatcherPauseOnAckStatePersistentEnabled;
+                    return namespacePolicy == null
+                            ? config().isDispatcherPauseOnAckStatePersistentEnabled()
+                            : namespacePolicy;
+                });
+            });
+    }
 
     @SuppressWarnings("deprecation")
     protected CompletableFuture<PersistencePolicies> internalGetPersistence(boolean applied, boolean isGlobal) {
