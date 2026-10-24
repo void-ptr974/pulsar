@@ -1002,11 +1002,17 @@ jobs:
           - name: Schema
             group: SCHEMA
 
-          - name: Pulsar Connectors - Thread
-            group: PULSAR_CONNECTORS_THREAD
+          - name: Pulsar Connectors - Thread - Shard 1 of 2
+            group: PULSAR_CONNECTORS_THREAD_SHARD_1
 
-          - name: Pulsar Connectors - Process Java
-            group: PULSAR_CONNECTORS_PROCESS_JAVA
+          - name: Pulsar Connectors - Thread - Shard 2 of 2
+            group: PULSAR_CONNECTORS_THREAD_SHARD_2
+
+          - name: Pulsar Connectors - Process Java - Shard 1 of 2
+            group: PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_1
+
+          - name: Pulsar Connectors - Process Java - Shard 2 of 2
+            group: PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_2
 
           - name: Pulsar Connectors - Process Python
             group: PULSAR_CONNECTORS_PROCESS_PYTHON

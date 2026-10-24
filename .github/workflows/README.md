@@ -126,6 +126,14 @@ local reproduction. Isolated tests are invoked once outside the shard filter. Ru
 dispatcher and suite partitions without Docker. The Gradle/TestNG fixture can also be run with
 `python3 pulsar-build/tests/test_ci_test_class_shards.py`.
 
+Process Java and Thread each use two method partitions of their inherited Java function tests. Each job keeps
+the original TestNG groups, lifecycle and retries in an independent cluster. The original unsharded Process,
+Java and Thread dispatchers remain available locally. The partition guard requires every inherited test method
+exactly once and rejects unreviewed selection or dependency changes; successful XML reports still need comparison for
+method and parameter multiplicities. Supplemental source/sink suite selections execute once across the two
+jobs. Method balancing reduces serial test work but adds another fixture and runner setup, so measure the
+complete CI gate and queue time rather than adding testcase durations as a predicted wall-time saving.
+
 The build output archives exclude `.gradle` directories. Gradle caches are managed separately by `setup-gradle`;
 a cold or incompatible cache can still cause compilation after an archive is restored. Compare actual compilation
 steps, artifact transfer time, queue time and accumulated runner minutes when assessing the benefit. CRC32 gives

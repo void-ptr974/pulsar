@@ -143,6 +143,17 @@ test_group_pulsar_connectors_thread() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-thread.xml -PtestGroups=sink "$@"
 }
 
+test_group_pulsar_connectors_thread_shard_1() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-thread-shard-1.xml -PtestGroups=function "$@"
+  # Preserve the original source/sink selections once across the method shards.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-thread.xml -PtestGroups=source "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-thread.xml -PtestGroups=sink "$@"
+}
+
+test_group_pulsar_connectors_thread_shard_2() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-thread-shard-2.xml -PtestGroups=function "$@"
+}
+
 test_group_pulsar_connectors_process() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=function "$@"
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=source "$@"
@@ -154,6 +165,17 @@ test_group_pulsar_connectors_process_java() {
   # Keep the original source/sink selections once across the three Process jobs.
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=source "$@"
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=sink "$@"
+}
+
+test_group_pulsar_connectors_process_java_shard_1() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process-java-shard-1.xml -PtestGroups=function "$@"
+  # Preserve the original source/sink selections once across the method shards.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=source "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=sink "$@"
+}
+
+test_group_pulsar_connectors_process_java_shard_2() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process-java-shard-2.xml -PtestGroups=function "$@"
 }
 
 test_group_pulsar_connectors_process_python() {

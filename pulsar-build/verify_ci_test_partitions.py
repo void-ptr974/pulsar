@@ -18,7 +18,7 @@
 # under the License.
 #
 
-"""Check whole-class CI partitions and the commands emitted by their dispatcher.
+"""Check CI class/method partitions and the commands emitted by their dispatcher.
 
 This is a source-only check: Gradle and report collection are replaced by recording
 stubs. It checks selection equivalence, not runtime Factory/provider/retry results;
@@ -33,6 +33,8 @@ import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+
+import verify_ci_java_function_methods
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,7 +161,8 @@ def verify_dispatcher(suite, original_group, shards, selections):
                 remaining = tuple(argument for argument in arguments if argument != suite_arguments[0])
                 if filename in selections:
                     for name, count in selections[filename].items():
-                        selected[("class", name, remaining)] += count
+                        selector = name if isinstance(name, tuple) else ("class", name)
+                        selected[(*selector, remaining)] += count
                 else:
                     # Preserve supplemental package suites and even empty suites
                     # by exact filename/arguments, rather than guessing their tests.
@@ -181,6 +184,18 @@ def main():
     for label, suite, original_group, shards in PARTITIONS:
         selections = verify_partition(label, suite, shards)
         verify_dispatcher(suite, original_group, shards, selections)
+    selections = verify_ci_java_function_methods.verify()
+    verify_dispatcher("pulsar-process-java", "PULSAR_CONNECTORS_PROCESS_JAVA", (
+        ("shard-1", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_1"),
+        ("shard-2", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_2"),
+    ), selections)
+    selections = verify_ci_java_function_methods.verify(
+        verify_ci_java_function_methods.THREAD_TARGET, "pulsar-thread.xml",
+        ("pulsar-thread-shard-1.xml", "pulsar-thread-shard-2.xml"), "Thread Java")
+    verify_dispatcher("pulsar-thread", "PULSAR_CONNECTORS_THREAD", (
+        ("shard-1", "PULSAR_CONNECTORS_THREAD_SHARD_1"),
+        ("shard-2", "PULSAR_CONNECTORS_THREAD_SHARD_2"),
+    ), selections)
 
 
 if __name__ == "__main__":
