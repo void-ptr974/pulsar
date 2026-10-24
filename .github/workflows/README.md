@@ -54,9 +54,9 @@ Duplicate names are allowed, and all checks with the same name will be treated t
 ### CI build and test dependencies
 
 `pulsar-ci.yaml` prepares Broker test dependencies before building the complete distribution. Broker Unit jobs
-consume `broker-test-build-outputs`; the remaining Unit jobs, image builds and publication checks consume the
-complete build outputs or wait for the complete build. This lets Broker tests start while distribution assembly
-continues. Binary license and publication validation remain required through the final CI check.
+consume `broker-test-build-outputs`. Other, Proxy, IO, Client and Metadata Unit jobs use a separate artifact
+producer in parallel with the complete build. Protobuf v3, image builds and publication checks keep the complete
+build dependency. Binary license and publication validation remain required through the final CI check.
 
 ```mermaid
 flowchart LR
@@ -64,7 +64,9 @@ flowchart LR
     B --> U[Broker Unit matrix: 12 jobs]
     B --> A[Complete build and source checks]
     B --> L[Prepare Integration runtime artifacts]
-    A --> O[Other Unit matrix: 6 jobs]
+    B --> N[Prepare default Unit test artifacts]
+    N --> O[Other Unit matrix: 5 jobs]
+    A --> T[Protobuf v3 Unit job]
     A --> V[Binary license and publication checks]
     A --> D[Docker test images]
     D --> I[Integration/System matrices]
@@ -72,12 +74,31 @@ flowchart LR
     A --> M[MacOS build]
     U --> G[All Unit tests completed]
     O --> G
+    T --> G
     G --> Q[CodeQL: existing conditions]
     G --> F[Final required CI check]
     V --> F
     I --> F
     M --> F
     Q --> F
+```
+
+The default Unit producer follows the original `test` task dependencies, including explicit NAR, shadow JAR
+and fixture producers, without executing any `Test` task. It archives only declared producer outputs and checks
+that each selected module's test runtime outputs are covered. Its five consumers restore
+`unit-test-build-outputs`. Protobuf v3 still rebuilds separately from `gradle-build-outputs` with its existing
+version override; it never consumes the default-version artifact. The one-off collector also requires
+`--no-configuration-cache`:
+
+```shell
+./gradlew prepareCiUnitTestArtifacts \
+  -x :pulsar-broker:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-admin-shade-test:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-all-shade-test:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-shade-test:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-native-image:prepareCiUnitTestArtifacts \
+  --init-script pulsar-build/ci_unit_artifacts.gradle --no-configuration-cache
+./pulsar-build/archive_ci_unit_outputs.sh /tmp/unit-test-build-outputs.tar
 ```
 
 The Integration artifact producer reuses the Broker artifact while the complete build continues. It prepares

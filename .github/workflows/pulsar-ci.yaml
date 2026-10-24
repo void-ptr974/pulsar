@@ -241,6 +241,72 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  other-unit-test-artifacts:
+    name: Prepare other Unit test artifacts
+    needs: [preconditions, broker-test-artifacts]
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK ${{ env.CI_JDK_MAJOR_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: false
+
+      - name: Restore Broker producer build outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: broker-test-build-outputs
+
+      - name: Extract Broker producer build outputs
+        run: tar xf broker-test-build-outputs.tar
+
+      - name: Prepare default Unit dependencies without running tests
+        run: >-
+          ./gradlew prepareCiUnitTestArtifacts
+          -x :pulsar-broker:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-admin-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-all-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-native-image:prepareCiUnitTestArtifacts
+          --init-script pulsar-build/ci_unit_artifacts.gradle
+          --no-configuration-cache
+
+      - name: Save other Unit test build outputs
+        run: ./pulsar-build/archive_ci_unit_outputs.sh /tmp/unit-test-build-outputs.tar
+
+      - name: Upload other Unit test build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-build-outputs
+          path: /tmp/unit-test-build-outputs.tar
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: 1
+
+      - name: Upload Gradle reports
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gradle-reports-other-unit-test-artifacts
+          path: '**/build/reports/'
+          retention-days: 7
+          if-no-files-found: ignore
+
   build-and-license-check:
     needs: [preconditions, broker-test-artifacts]
     name: Build and License check
@@ -452,7 +518,7 @@ jobs:
       NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout || 60 }}
-    needs: ['preconditions', 'build-and-license-check']
+    needs: ['preconditions', 'other-unit-test-artifacts']
     if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
     strategy:
       fail-fast: false
@@ -469,6 +535,49 @@ jobs:
             group: CLIENT
           - name: Pulsar Metadata
             group: METADATA
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ needs.preconditions.outputs.jdk_major_version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ needs.preconditions.outputs.jdk_major_version }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+      - name: Run Unit group with diagnostics
+        uses: ./.github/actions/run-unit-test-group
+        with:
+          group: ${{ matrix.group }}
+          name: ${{ matrix.name }}
+          build-artifact: unit-test-build-outputs
+
+  # Keep the protobuf-v3 rebuild isolated from default protobuf-v4 artifacts.
+  unit-tests-protobufv3:
+    name: CI - Unit - ${{ matrix.name }}
+    env:
+      JOB_NAME: CI - Unit - ${{ matrix.name }}
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+      TRACE_TEST_RESOURCE_CLEANUP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trace_test_resource_cleanup || 'off' }}
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.thread_leak_detector_wait_millis || 10000 }}
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: "${{ needs.preconditions.outputs.netty_leak_detection }}"
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: ['preconditions', 'build-and-license-check']
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - name: Protobuf v3
             group: PROTOBUFV3
 
@@ -497,16 +606,17 @@ jobs:
   # Preserve the existing all-Unit dependency used by CodeQL and the final gate.
   unit-tests:
     name: All Unit tests completed
-    needs: [preconditions, unit-tests-broker, unit-tests-other]
+    needs: [preconditions, unit-tests-broker, unit-tests-other, unit-tests-protobufv3]
     if: ${{ always() && needs.preconditions.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Require both Unit matrices to succeed
+      - name: Require all Unit groups to succeed
         run: |
           [[ "${{ needs.preconditions.result }}" == "success" \
           && "${{ needs.unit-tests-broker.result }}" == "success" \
-          && "${{ needs.unit-tests-other.result }}" == "success" ]]
+          && "${{ needs.unit-tests-other.result }}" == "success" \
+          && "${{ needs.unit-tests-protobufv3.result }}" == "success" ]]
 
   macos-build:
     name: Build Pulsar on MacOS
@@ -1107,5 +1217,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts \
-            --jq '.artifacts[] | select(.name == "broker-test-build-outputs" or .name == "integration-test-build-outputs" or .name == "gradle-build-outputs" or .name == "java-test-image" or .name == "pulsar-test-latest-version-image") | .id' \
+            --jq '.artifacts[] | select(.name == "broker-test-build-outputs" or .name == "integration-test-build-outputs" or .name == "unit-test-build-outputs" or .name == "gradle-build-outputs" or .name == "java-test-image" or .name == "pulsar-test-latest-version-image") | .id' \
             | xargs -I{} gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/{} || true
