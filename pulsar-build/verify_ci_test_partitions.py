@@ -35,6 +35,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 import verify_ci_java_function_methods
+from verify_ci_workflow_matrices import verify_matrix
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,29 @@ PARTITIONS = (
         ("tools", "CLI_TOOLS"),
     )),
 )
+JAVA_PROCESS_SHARDS = (
+    ("shard-1", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_1"),
+    ("shard-2", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_2"),
+)
+JAVA_THREAD_SHARDS = (
+    ("shard-1", "PULSAR_CONNECTORS_THREAD_SHARD_1"),
+    ("shard-2", "PULSAR_CONNECTORS_THREAD_SHARD_2"),
+)
+
+
+def verify_workflow_matrices(workflow=None):
+    workflow = workflow or ROOT / ".github/workflows/pulsar-ci.yaml"
+    groups = {label: [group for _, group in shards] for label, _, _, shards in PARTITIONS}
+    integration = ["BACKWARDS_COMPAT", *groups["CLI"], *groups["Messaging"], "LOADBALANCE",
+                   "STANDALONE", "TRANSACTION", "METRICS", "UPGRADE", "PULSAR_K8S",
+                   ("SHADE_RUN", "17"), ("SHADE_RUN", "21"), ("SHADE_RUN", "25"),
+                   ("NATIVE_IMAGE", "25")]
+    system = ["TIERED_FILESYSTEM", "TIERED_JCLOUD", "FUNCTION", "SCHEMA", "PLUGIN",
+              *(group for _, group in JAVA_THREAD_SHARDS),
+              *(group for _, group in JAVA_PROCESS_SHARDS),
+              *(group for group in groups["Process"] if group != "PULSAR_CONNECTORS_PROCESS_JAVA")]
+    verify_matrix(workflow, "integration-tests", integration)
+    verify_matrix(workflow, "system-tests", system)
 
 
 def read_suite(filename):
@@ -180,22 +204,17 @@ def verify_dispatcher(suite, original_group, shards, selections):
     print(f"{original_group} dispatcher preserves classes, supplemental suites, groups and CI flags")
 
 
-def main():
+def main(workflow=None):
+    verify_workflow_matrices(workflow)
     for label, suite, original_group, shards in PARTITIONS:
         selections = verify_partition(label, suite, shards)
         verify_dispatcher(suite, original_group, shards, selections)
     selections = verify_ci_java_function_methods.verify()
-    verify_dispatcher("pulsar-process-java", "PULSAR_CONNECTORS_PROCESS_JAVA", (
-        ("shard-1", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_1"),
-        ("shard-2", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_2"),
-    ), selections)
+    verify_dispatcher("pulsar-process-java", "PULSAR_CONNECTORS_PROCESS_JAVA", JAVA_PROCESS_SHARDS, selections)
     selections = verify_ci_java_function_methods.verify(
         verify_ci_java_function_methods.THREAD_TARGET, "pulsar-thread.xml",
         ("pulsar-thread-shard-1.xml", "pulsar-thread-shard-2.xml"), "Thread Java")
-    verify_dispatcher("pulsar-thread", "PULSAR_CONNECTORS_THREAD", (
-        ("shard-1", "PULSAR_CONNECTORS_THREAD_SHARD_1"),
-        ("shard-2", "PULSAR_CONNECTORS_THREAD_SHARD_2"),
-    ), selections)
+    verify_dispatcher("pulsar-thread", "PULSAR_CONNECTORS_THREAD", JAVA_THREAD_SHARDS, selections)
 
 
 if __name__ == "__main__":

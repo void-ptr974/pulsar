@@ -1,0 +1,89 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import groovy.json.JsonOutput
+import javax.inject.Inject
+import org.gradle.api.GradleException
+import org.gradle.api.configuration.BuildFeatures
+import org.gradle.api.tasks.testing.Test
+
+abstract class CiArtifactVerificationFeatures {
+    @Inject
+    abstract BuildFeatures getBuildFeatures()
+}
+
+// This CI-only graph check must run for each invocation. The preparation tasks themselves
+// support configuration caching, but a cached task graph cannot replace this verification.
+def features = gradle.extensions.create("ciArtifactVerificationFeatures", CiArtifactVerificationFeatures).buildFeatures
+if (features.configurationCache.requested.getOrElse(false)) {
+    throw new GradleException("CI artifact dependency verification requires --no-configuration-cache")
+}
+
+gradle.taskGraph.whenReady { graph ->
+    def prepareTasks = graph.allTasks.findAll {
+        it.name in ["prepareCiUnitTestArtifacts", "prepareCiTestArtifacts"]
+    }
+    if (prepareTasks.isEmpty()) {
+        return
+    }
+    def scheduledTests = graph.allTasks.findAll { it instanceof Test }
+    if (!scheduledTests.isEmpty()) {
+        throw new GradleException("CI artifact producer must not execute tests: ${scheduledTests*.path}")
+    }
+    def scheduledPaths = graph.allTasks*.path as Set
+    def verified = prepareTasks.collect { prepare ->
+        def metadata = prepare.extensions.extraProperties
+        def keys = ["ciArtifactTargetTestName", "ciArtifactTargetTestPath", "ciArtifactExpectedDependencies"]
+        if (!keys.every { metadata.has(it) }) {
+            throw new GradleException("CI artifact producer has no captured Test dependencies: ${prepare.path}")
+        }
+        def targetPath = metadata.get("ciArtifactTargetTestPath")
+        def targetName = metadata.get("ciArtifactTargetTestName")
+        def expectedTarget = "${prepare.project.path == ':' ? '' : prepare.project.path}:${targetName}"
+        if (targetPath != expectedTarget) {
+            throw new GradleException("CI artifact producer target does not match ${expectedTarget}: ${targetPath}")
+        }
+        def expected = new TreeSet(metadata.get("ciArtifactExpectedDependencies"))
+        def actual = new TreeSet(graph.getDependencies(prepare)*.path)
+        // getDependencies can still return a dependency excluded with -x. It must also be
+        // present in allTasks, otherwise existing output could conceal an unprepared fixture.
+        def missing = new TreeSet(expected - actual)
+        def visited = new HashSet()
+        def visit
+        visit = { task ->
+            graph.getDependencies(task).each { dependency ->
+                if (!scheduledPaths.contains(dependency.path)) {
+                    missing.add(dependency.path)
+                } else if (visited.add(dependency)) {
+                    visit(dependency)
+                }
+            }
+        }
+        visit(prepare)
+        if (actual != expected || !missing.isEmpty()) {
+            throw new GradleException("CI artifact producer dependencies differ from ${targetPath}: "
+                    + "missing=${missing}, unexpected=${actual - expected}")
+        }
+        [prepareTask: prepare.path, testTask: targetPath, dependencies: expected.toList()]
+    }.sort { it.prepareTask }
+    def report = gradle.rootProject.layout.buildDirectory.file("ci-artifact-dependencies.json").get().asFile
+    report.parentFile.mkdirs()
+    report.text = JsonOutput.prettyPrint(JsonOutput.toJson([schemaVersion: 1, verified: verified])) + "\n"
+    println "Verified actual Test dependencies for ${verified.size()} CI artifact preparation task(s)."
+}

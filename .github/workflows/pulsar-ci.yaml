@@ -39,6 +39,7 @@ on:
         options:
           - '25'
           - '21'
+          - '26'
         default: '25'
       trace_test_resource_cleanup:
         description: 'Collect thread & heap information before exiting a test JVM. When set to "on", thread dump and heap histogram will be collected. When set to "full", a heap dump will also be collected.'
@@ -69,14 +70,23 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CI_ENABLE_SSH: ${{ vars.CI_ENABLE_SSH }}
   # defines the retention period for the intermediate build artifacts needed for rerunning a failed build job
   # it's possible to rerun individual failed jobs when the build artifacts are available
   # if the artifacts have already been expired, the complete workflow can be rerun by closing and reopening the PR or by rebasing the PR
   ARTIFACT_RETENTION_DAYS: 3
   JDK_DISTRIBUTION: corretto
 
+# Do not depend on the repository or enterprise default token permissions.
+permissions:
+  contents: read
+
 jobs:
   preconditions:
+    permissions:
+      contents: read
+      pull-requests: read # List changed files and check whether the PR is ready.
+      actions: write # Cancel scheduled runs in forks.
     name: Preconditions
     runs-on: ubuntu-24.04
     outputs:
@@ -106,8 +116,13 @@ jobs:
           echo "jdk_major_version=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.jdk_major_version || '25'}}" >> $GITHUB_OUTPUT
 
       - name: checkout
-        if: ${{ github.event_name == 'pull_request' }}
         uses: actions/checkout@v6
+
+      - name: Check ASF action allowlist
+        if: ${{ (github.event.pull_request.base.repo.owner.login || github.repository_owner) == 'apache' }}
+        uses: apache/infrastructure-actions/allowlist-check@main
+        with:
+          scan-glob: '.github/**/*.y*ml'
 
       - name: Detect changed files
         if: ${{ github.event_name == 'pull_request' }}
@@ -126,6 +141,10 @@ jobs:
           else
             echo docs_only=false >> $GITHUB_OUTPUT
           fi
+
+      - name: Check if the PR is ready for running CI
+        if: ${{ steps.check_changes.outputs.docs_only != 'true' && github.repository == 'apache/pulsar' && github.event_name == 'pull_request' }}
+        uses: ./.github/actions/check-pr-ready-to-test
 
       - name: Set Netty leak detection mode
         id: netty_leak_detection
@@ -150,6 +169,8 @@ jobs:
         run: |
           python3 pulsar-build/verify_ci_test_partitions.py
           python3 pulsar-build/verify_ci_broker_shards.py
+          python3 -m unittest discover -s pulsar-build/tests -p test_ci_workflow_matrices.py
+          python3 -m unittest discover -s pulsar-build/tests -p test_ci_java_function_method_guards.py
 
       - name: Tune Runner VM
         uses: ./.github/actions/tune-runner-vm
@@ -167,7 +188,10 @@ jobs:
           cache-read-only: false
 
       - name: Prepare complete Broker test dependencies without executing tests
-        run: ./gradlew :pulsar-broker:prepareCiTestArtifacts --no-configuration-cache
+        run: >-
+          ./gradlew :pulsar-broker:prepareCiTestArtifacts
+          --init-script pulsar-build/verify_ci_artifact_dependencies.gradle
+          --no-configuration-cache
 
       - name: Save Broker test build outputs
         run: ./pulsar-build/archive_ci_build_outputs.sh /tmp/broker-test-build-outputs.tar
@@ -218,6 +242,8 @@ jobs:
       - name: Prepare Integration runtime without running tests
         run: >-
           ./gradlew :tests:integration:prepareCiTestArtifacts
+          -Pinttest.skipDockerBuild
+          --init-script pulsar-build/verify_ci_artifact_dependencies.gradle
           --init-script pulsar-build/ci_integration_artifacts.gradle
           --no-configuration-cache
 
@@ -284,6 +310,11 @@ jobs:
           -x :tests:pulsar-client-all-shade-test:prepareCiUnitTestArtifacts
           -x :tests:pulsar-client-shade-test:prepareCiUnitTestArtifacts
           -x :tests:pulsar-client-native-image:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-admin-v5-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-v5-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-v5-all-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-java-compatibility:prepareCiUnitTestArtifacts
+          --init-script pulsar-build/verify_ci_artifact_dependencies.gradle
           --init-script pulsar-build/ci_unit_artifacts.gradle
           --no-configuration-cache
 
@@ -338,7 +369,9 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: ${{ env.JDK_DISTRIBUTION }}
-          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+          java-version: |
+            17
+            ${{ env.CI_JDK_MAJOR_VERSION }}
 
       - name: Setup Gradle
         uses: ./.github/actions/setup-gradle
@@ -390,7 +423,7 @@ jobs:
 
 
   publication-checks:
-    name: Binary license and publication checks
+    name: Compatibility, binary license and publication checks
     needs: [preconditions, build-and-license-check]
     if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
@@ -408,7 +441,9 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: ${{ env.JDK_DISTRIBUTION }}
-          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+          java-version: |
+            17
+            ${{ env.CI_JDK_MAJOR_VERSION }}
 
       - name: Setup Gradle
         uses: ./.github/actions/setup-gradle
@@ -423,11 +458,20 @@ jobs:
       - name: Extract build outputs
         run: tar xf gradle-build-outputs.tar
 
+      - name: Verify client and Functions API Java compatibility
+        run: ./gradlew :tests:pulsar-client-java-compatibility:test -PtestRetryCount=0
+
       - name: Check binary licenses
         run: ./gradlew checkBinaryLicense --no-configuration-cache
 
       - name: Check that project's public libraries can be published to a Maven repository
         run: ./gradlew publishAllPublicationsToLocalDeployRepository
+
+      - name: Check API/SPI publication dependency closure with a custom group
+        # Validate generated POMs and Gradle metadata, including the BOM, without uploading artifacts.
+        run: >-
+          ./gradlew validateApiSpiPublication
+          -PpublishApiAndSpiOnly=true -Pgroup=myorg.pulsar
 
       - name: Upload Gradle reports
         if: ${{ !success() }}
@@ -688,6 +732,13 @@ jobs:
       - name: Extract build outputs
         run: tar xf gradle-build-outputs.tar
 
+      - name: Setup Docker
+        uses: gradle/develocity-actions/setup-docker@f852d93dada312948b1ba533226c28e05d756866 # v2.4
+        with:
+          develocity-url: https://develocity.apache.org
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          develocity-project-id: pulsar
+
       - name: Build java-test-image Docker image
         run: ./gradlew :tests:java-test-image:dockerBuild${{ env.CI_JDK_MAJOR_VERSION != '21' && format(' -PdockerJavaVersion={0}', env.CI_JDK_MAJOR_VERSION) || '' }}
 
@@ -720,6 +771,8 @@ jobs:
       JOB_NAME: CI - Integration - ${{ matrix.name }}
       PULSAR_TEST_IMAGE_NAME: apachepulsar/java-test-image:latest
       CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+      NETTY_LEAK_DETECTION: "${{ needs.preconditions.outputs.netty_leak_detection }}"
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
     strategy:
       fail-fast: false
       matrix:
@@ -813,7 +866,7 @@ jobs:
       # which requires a GraalVM JDK. This overrides JAVA_HOME for that matrix entry only.
       - name: Set up GraalVM
         if: ${{ matrix.group == 'NATIVE_IMAGE' }}
-        uses: graalvm/setup-graalvm@329c42c5f4c343bceb505f0b28cc8499bc2bf174 # v1.5.4
+        uses: graalvm/setup-graalvm@0426e2e191540e8514dff98dc52a5f5146a2a276 # v1.6.6
         with:
           distribution: 'graalvm-community'
           java-version: 25 # always use GraalVM 25.x
@@ -852,6 +905,10 @@ jobs:
         if: ${{ always() }}
         uses: ./.github/actions/copy-test-reports
 
+      - name: Report detected Netty leaks
+        if: ${{ always() && env.NETTY_LEAK_DETECTION != 'off' }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+
       - name: Upload test reports
         uses: actions/upload-artifact@v7
         if: ${{ !success() || github.repository != 'apache/pulsar' }}
@@ -873,6 +930,7 @@ jobs:
             **/hs_err_*.log
             **/core.*
             build/threaddumps/
+            ${{ env.NETTY_LEAK_DUMP_DIR }}/*
           retention-days: 7
           if-no-files-found: ignore
 
@@ -893,6 +951,9 @@ jobs:
           action: wait
 
   pulsar-test-latest-version-image:
+    permissions:
+      contents: read
+      security-events: write # Upload scheduled container scan results.
     name: Build pulsar-test-latest-version Docker image
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -932,6 +993,13 @@ jobs:
 
       - name: Extract build outputs
         run: tar xf gradle-build-outputs.tar
+
+      - name: Setup Docker
+        uses: gradle/develocity-actions/setup-docker@f852d93dada312948b1ba533226c28e05d756866 # v2.4
+        with:
+          develocity-url: https://develocity.apache.org
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          develocity-project-id: pulsar
 
       - name: Build pulsar-test-latest-version Docker image
         run: ./gradlew :tests:latest-version-image:dockerBuild${{ env.CI_JDK_MAJOR_VERSION != '21' && format(' -PdockerJavaVersion={0}', env.CI_JDK_MAJOR_VERSION) || '' }}
@@ -986,6 +1054,8 @@ jobs:
       JOB_NAME: CI - System - ${{ matrix.name }}
       PULSAR_TEST_IMAGE_NAME: apachepulsar/pulsar-test-latest-version:latest
       CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+      NETTY_LEAK_DETECTION: "${{ needs.preconditions.outputs.netty_leak_detection }}"
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
     strategy:
       fail-fast: false
       matrix:
@@ -1077,6 +1147,10 @@ jobs:
         if: ${{ always() }}
         uses: ./.github/actions/copy-test-reports
 
+      - name: Report detected Netty leaks
+        if: ${{ always() && env.NETTY_LEAK_DETECTION != 'off' }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+
       - name: Upload test reports
         uses: actions/upload-artifact@v7
         # Keep successful personal-CI reports to compare coverage and timings.
@@ -1099,6 +1173,7 @@ jobs:
             **/hs_err_*.log
             **/core.*
             build/threaddumps/
+            ${{ env.NETTY_LEAK_DUMP_DIR }}/*
           retention-days: 7
           if-no-files-found: ignore
 
@@ -1123,7 +1198,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: ['preconditions', 'unit-tests']
-    if: ${{ (needs.preconditions.outputs.java_non_tests == 'true' || github.event_name != 'pull_request') && ((github.event_name == 'pull_request' && github.base_ref == 'master') || (github.event_name != 'pull_request' && github.ref_name == 'master')) }}
+    # Private repositories need Code Security enabled before opting in.
+    if: ${{ (github.event.repository.visibility == 'public' || vars.CI_ENABLE_CODEQL == 'true') && (needs.preconditions.outputs.java_non_tests == 'true' || github.event_name != 'pull_request') && ((github.event_name == 'pull_request' && github.base_ref == 'master') || (github.event_name != 'pull_request' && github.ref_name == 'master')) }}
     permissions:
       actions: read
       contents: read
@@ -1184,6 +1260,8 @@ jobs:
   # protected_branches section for master branch required_status_checks.
   # It depends on all other jobs in this workflow.
   pulsar-ci-checks-completed:
+    permissions:
+      actions: write # Delete intermediate build artifacts.
     name: "Pulsar CI checks completed"
     # run always, but skip for other repositories than apache/pulsar when a scheduled workflow is cancelled
     # this is to allow the workflow scheduled jobs to show as cancelled instead of failed since scheduled

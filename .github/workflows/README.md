@@ -56,7 +56,7 @@ Duplicate names are allowed, and all checks with the same name will be treated t
 `pulsar-ci.yaml` prepares Broker test dependencies before building the complete distribution. Broker Unit jobs
 consume `broker-test-build-outputs`. Other, Proxy, IO, Client and Metadata Unit jobs use a separate artifact
 producer in parallel with the complete build. Protobuf v3, image builds and publication checks keep the complete
-build dependency. Binary license and publication validation remain required through the final CI check.
+build dependency. Java compatibility, binary license and publication validation remain required through the final CI check.
 
 ```mermaid
 flowchart LR
@@ -67,7 +67,7 @@ flowchart LR
     B --> N[Prepare default Unit test artifacts]
     N --> O[Other Unit matrix: 5 jobs]
     A --> T[Protobuf v3 Unit job]
-    A --> V[Binary license and publication checks]
+    A --> V[Compatibility, binary license and publication checks]
     A --> D[Docker test images]
     D --> I[Integration/System matrices]
     L --> I
@@ -97,6 +97,11 @@ version override; it never consumes the default-version artifact. The one-off co
   -x :tests:pulsar-client-all-shade-test:prepareCiUnitTestArtifacts \
   -x :tests:pulsar-client-shade-test:prepareCiUnitTestArtifacts \
   -x :tests:pulsar-client-native-image:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-admin-v5-test:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-v5-shade-test:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-v5-all-test:prepareCiUnitTestArtifacts \
+  -x :tests:pulsar-client-java-compatibility:prepareCiUnitTestArtifacts \
+  --init-script pulsar-build/verify_ci_artifact_dependencies.gradle \
   --init-script pulsar-build/ci_unit_artifacts.gradle --no-configuration-cache
 ./pulsar-build/archive_ci_unit_outputs.sh /tmp/unit-test-build-outputs.tar
 ```
@@ -109,10 +114,17 @@ runner-side transfers without dropping generated resources, shared test JARs or 
 The one-off manifest collector uses the realized task graph and must run with `--no-configuration-cache`:
 
 ```shell
-./gradlew :tests:integration:prepareCiTestArtifacts \
+./gradlew :tests:integration:prepareCiTestArtifacts -Pinttest.skipDockerBuild \
+  --init-script pulsar-build/verify_ci_artifact_dependencies.gradle \
   --init-script pulsar-build/ci_integration_artifacts.gradle --no-configuration-cache
 ./pulsar-build/archive_ci_integration_outputs.sh /tmp/integration-test-build-outputs.tar
 ```
+
+All three artifact producers follow the real target Test task dependencies. The CI init-script verifier compares
+captured dependency paths with the finalized execution graph, rejects excluded required producers, and rejects
+any scheduled Test task. This catches a new fixture dependency automatically and fails when a required producer
+is disconnected. The verifier requires `--no-configuration-cache`; the prepare tasks themselves still support
+configuration caching. Undeclared runtime file reads remain a test/build dependency bug that this graph cannot detect.
 
 Unit jobs initialize JDK and Gradle directly in the workflow before invoking the test and diagnostics composite.
 This keeps Gradle's post-action inputs outside an additional nested composite context. Confirm cache read-only
@@ -125,6 +137,11 @@ local reproduction. Isolated tests are invoked once outside the shard filter. Ru
 `python3 pulsar-build/verify_ci_broker_shards.py` and `python3 pulsar-build/verify_ci_test_partitions.py` to check the
 dispatcher and suite partitions without Docker. The Gradle/TestNG fixture can also be run with
 `python3 pulsar-build/tests/test_ci_test_class_shards.py`.
+
+The guards also read the actual Broker, Integration and System workflow matrices and require every expected
+group/JDK entry exactly once, including all three Shade JDK variants. Removing a matrix row, duplicating a row
+or selecting an unknown group fails before building test artifacts. The parser intentionally accepts only the
+reviewed literal include-matrix format; matrix syntax or group changes require updating the guard and its tests.
 
 Process Java and Thread each use two method partitions of their inherited Java function tests. Each job keeps
 the original TestNG groups, lifecycle and retries in an independent cluster. The original unsharded Process,

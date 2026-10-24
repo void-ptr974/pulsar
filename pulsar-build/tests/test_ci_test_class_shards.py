@@ -21,10 +21,12 @@
 """Exercise the production class-file shard filter with Gradle and real TestNG discovery.
 
 Run from any directory with JDK 21/25 and the repository wrapper available:
-  python3 pulsar-build/tests/test_ci_test_class_shards.py [--offline] [--output-dir DIR]
+  python3 pulsar-build/tests/test_ci_test_class_shards.py [--offline] [--source-root DIR] [--output-dir DIR]
 
 The fixture compares both XML invocation counts and explicit parameter/Factory identities.
 No Pulsar broker, container, or full build is started.
+Production ordering and selection/retry support are reused. Netty, thread-leak and
+singleton listeners are outside this selection fixture's scope.
 """
 
 import argparse
@@ -37,8 +39,10 @@ import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 
+from test_ci_java_function_methods import (LISTENER_BOUNDARY, copy_selection_support,
+                                           production_testng_settings)
+
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = ROOT / "build-logic/conventions/src/main/java/TestClassShardFilter.java"
 
 SOURCES = {
     "Events.java": r"""
@@ -97,8 +101,12 @@ public class FactoryTest {
     private final int instance;
     @DataProvider public static Object[][] instances() { return new Object[][] {{1}, {2}}; }
     @Factory(dataProvider = "instances") public FactoryTest(int instance) { this.instance = instance; }
+    @BeforeClass(alwaysRun = true) public void setupFactory() throws Exception { Events.record("LIFECYCLE:setup:" + instance); }
+    @AfterClass(alwaysRun = true) public void cleanupFactory() throws Exception { Events.record("LIFECYCLE:cleanup:" + instance); }
     @Test(groups = "broker")
     public void factoryInstance() throws Exception { Events.record("FactoryTest:instance:" + instance); }
+    @Test(groups = "broker")
+    public void factorySecondInstance() throws Exception { Events.record("FactoryTest:second:" + instance); }
 }
 """,
 }
@@ -122,19 +130,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--output-dir", type=Path, help="Keep the generated project, reports and logs")
+    parser.add_argument("--source-root", type=Path, default=ROOT)
     args = parser.parse_args()
     directory = (args.output_dir or Path(tempfile.mkdtemp(prefix="pulsar-ci-class-shards-"))).resolve()
     directory.mkdir(parents=True, exist_ok=True)
+    source_root = args.source_root.resolve()
+    settings = production_testng_settings(source_root)
+    fingerprints = copy_selection_support(source_root, directory)
     build_src = directory / "buildSrc"
     (build_src / "src/main/java").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(SPEC, build_src / "src/main/java/TestClassShardFilter.java")
+    shutil.copy2(source_root / "build-logic/conventions/src/main/java/TestClassShardFilter.java",
+                 build_src / "src/main/java/TestClassShardFilter.java")
     (build_src / "build.gradle").write_text("plugins { id 'java-gradle-plugin' }\n")
     (directory / "settings.gradle").write_text(
         "rootProject.name = 'ci-class-shard-contract'\n"
         "dependencyResolutionManagement { versionCatalogs { libs { from(files("
-        + groovy_string(ROOT / "gradle/libs.versions.toml") + ")) } } }\n")
+        + groovy_string(source_root / "gradle/libs.versions.toml") + ")) } } }\n")
     # Reuse the production convention block, including the task cache input.
-    convention = (ROOT / "build-logic/conventions/src/main/kotlin/pulsar.java-conventions.gradle.kts").read_text()
+    convention = (source_root / "build-logic/conventions/src/main/kotlin/pulsar.java-conventions.gradle.kts").read_text()
     match = re.search(r'    providers.gradleProperty\("testClassShard"\).*?\n    }', convention, re.S)
     if not match:
         raise AssertionError("Production convention no longer configures testClassShard")
@@ -142,20 +155,36 @@ def main():
 plugins { java }
 repositories { mavenCentral() }
 dependencies {
+    implementation(libs.testng)
+    implementation(libs.slog)
+    implementation(libs.commons.lang3)
+    implementation(libs.slf4j.api)
+    compileOnly(libs.lombok)
+    annotationProcessor(libs.lombok)
     testImplementation(libs.testng)
     testImplementation(libs.slf4j.api)
+    testRuntimeOnly(libs.log4j.core)
+    testRuntimeOnly(libs.log4j.slf4j2.impl)
 }
 tasks.withType<Test>().configureEach {
-    useTestNG { includeGroups("broker"); excludeGroups("quarantine", "flaky") }
+    useTestNG {
+        isPreserveOrder = PRODUCTION_PRESERVE_ORDER
+        isGroupByInstances = PRODUCTION_GROUP_BY_INSTANCES
+        includeGroups("broker"); excludeGroups("quarantine", "flaky")
+        listeners.addAll(listOf("org.apache.pulsar.tests.AnnotationListener", "org.apache.pulsar.tests.FailFastNotifier"))
+    }
     maxParallelForks = 1
+    systemProperty("testRetryCount", "1")
+    systemProperty("testFailFast", "true")
     systemProperty("eventsFile", providers.gradleProperty("eventsFile").get())
-''' + match.group() + "\n}\n")
+'''.replace("PRODUCTION_PRESERVE_ORDER", str(settings["PreserveOrder"]).lower())
+        .replace("PRODUCTION_GROUP_BY_INSTANCES", str(settings["GroupByInstances"]).lower()) + match.group() + "\n}\n")
     source_dir = directory / "src/test/java/fixture"
     source_dir.mkdir(parents=True, exist_ok=True)
     for filename, source in SOURCES.items():
         (source_dir / filename).write_text(source)
 
-    command = [str(ROOT / "gradlew"), "-p", str(directory), "test", "--no-daemon", "--console=plain",
+    command = [str(source_root / "gradlew"), "-p", str(directory), "test", "--no-daemon", "--console=plain",
                "--configuration-cache", "--rerun-tasks", "--max-workers=2"]
     if args.offline:
         command.append("--offline")
@@ -165,11 +194,24 @@ tasks.withType<Test>().configureEach {
         events_file = directory / (label + ".events")
         events_file.unlink(missing_ok=True)
         result = subprocess.run(command + ["-PeventsFile=" + str(events_file)] + properties,
-                                cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         (directory / (label + ".log")).write_text(result.stdout)
         if result.returncode:
             raise AssertionError(label + " failed; see " + str(directory / (label + ".log")))
-        events = Counter(events_file.read_text().splitlines()) if events_file.exists() else Counter()
+        lines = events_file.read_text().splitlines() if events_file.exists() else []
+        if settings["GroupByInstances"]:
+            active = None
+            for line in lines:
+                if line.startswith("LIFECYCLE:setup:"):
+                    assert active is None, ("overlapping factory fixtures", lines)
+                    active = line.rsplit(":", 1)[-1]
+                elif line.startswith("LIFECYCLE:cleanup:"):
+                    assert active == line.rsplit(":", 1)[-1], lines
+                    active = None
+                elif line.startswith("FactoryTest:"):
+                    assert active == line.rsplit(":", 1)[-1], lines
+            assert active is None, ("factory fixture not cleaned", lines)
+        events = Counter(line for line in lines if not line.startswith("LIFECYCLE:"))
         outcomes[label] = (events, xml_records(directory))
 
     run("baseline", [])
@@ -181,14 +223,15 @@ tasks.withType<Test>().configureEach {
         raise AssertionError("Shard Spec did not survive configuration-cache reuse")
 
     baseline_events, baseline_xml = outcomes["baseline"]
-    assert sum(baseline_events.values()) == 10, baseline_events
+    assert sum(baseline_events.values()) == 12, baseline_events
     assert outcomes["shard1"][0] and outcomes["shard2"][0], "Both shards must execute tests"
     assert baseline_events == outcomes["shard1"][0] + outcomes["shard2"][0], outcomes
     assert baseline_xml == outcomes["shard1"][1] + outcomes["shard2"][1], outcomes
     assert not (outcomes["shard1"][0] & outcomes["shard2"][0]), outcomes
     assert all(key[2] == "passed" for key in baseline_xml)
-    assert sum(baseline_xml.values()) == 10, baseline_xml
-    factory = Counter({"FactoryTest:instance:1": 1, "FactoryTest:instance:2": 1})
+    assert sum(baseline_xml.values()) == 12, baseline_xml
+    factory = Counter({"FactoryTest:instance:1": 1, "FactoryTest:instance:2": 1,
+                       "FactoryTest:second:1": 1, "FactoryTest:second:2": 1})
     assert baseline_events & factory == factory
     assert baseline_events["fixture.AlphaTest:inherited"] == 1
     assert baseline_events["AlphaTest:parameters:one"] == 2
@@ -197,12 +240,15 @@ tasks.withType<Test>().configureEach {
     for label in ("shard1", "shard2"):
         assert bool(outcomes[label][0]["NewlyAddedTest:newClass"]) == bool(
             outcomes[label][0]["NewlyAddedTest:NestedTest"])
-    summary = {"passed": True, "baseline_invocations": 10,
+    summary = {"passed": True, "baseline_invocations": 12,
                "shard_invocations": {label: sum(outcomes[label][0].values()) for label in ("shard1", "shard2")},
                "exact_xml_partition": True, "exact_parameter_and_factory_identity_partition": True,
                "inheritance_preserved": True, "nested_class_kept_with_outer": True,
                "group_exclusions_preserved": True, "new_class_automatically_included": True,
                "configuration_cache_reused": True, "fixture_directory": str(directory)}
+    summary.update(production_testng_options=settings, support_source_sha256=fingerprints,
+                   factory_fixtures_do_not_overlap=settings["GroupByInstances"],
+                   listener_boundary=LISTENER_BOUNDARY, source_root=str(source_root))
     (directory / "validation.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 

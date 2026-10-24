@@ -27,6 +27,8 @@ from pathlib import Path
 import subprocess
 import zlib
 
+from verify_ci_workflow_matrices import verify_matrix
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "pulsar-build/run_unit_group_gradle.sh"
 BASE_CALLS = {
@@ -73,7 +75,7 @@ def shard_number(binary_name, count):
     return zlib.crc32(outer.encode("utf-8")) % count + 1
 
 
-def verify():
+def verify(workflow=None):
     jobs = []
     calls = {}
     for base, expected in BASE_CALLS.items():
@@ -95,6 +97,8 @@ def verify():
                 raise AssertionError(f"{job}: shard invocation/filter contract changed: {actual!r}")
             jobs.append(job)
             calls[job] = actual
+
+    verify_matrix(workflow or ROOT / ".github/workflows/pulsar-ci.yaml", "unit-tests-broker", jobs)
 
     source_root = ROOT / "pulsar-broker/src/test/java"
     inventory = [str(path.relative_to(source_root)).removesuffix(".java").replace("/", ".")

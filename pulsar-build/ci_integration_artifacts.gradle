@@ -24,12 +24,17 @@ gradle.taskGraph.whenReady { graph ->
     if (!graph.hasTask(preparePath)) {
         return
     }
+    def skipDockerBuild = gradle.rootProject.providers.gradleProperty("inttest.skipDockerBuild")
+            .map { it.isEmpty() || it.toBoolean() }.getOrElse(false)
+    if (!skipDockerBuild) {
+        throw new GradleException("Lean Integration artifacts require -Pinttest.skipDockerBuild; CI loads separate images")
+    }
     def rootPath = gradle.rootProject.projectDir.toPath().toAbsolutePath().normalize()
     def prepareTask = graph.allTasks.find { it.path == preparePath }
     def requiredTasks = new LinkedHashSet()
     def collectDependencies
     collectDependencies = { task ->
-        task.taskDependencies.getDependencies(task).each { dependency ->
+        graph.getDependencies(task).each { dependency ->
             if (requiredTasks.add(dependency)) {
                 collectDependencies(dependency)
             }
