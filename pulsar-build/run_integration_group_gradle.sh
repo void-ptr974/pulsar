@@ -122,6 +122,21 @@ test_group_pulsar_connectors_process() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=sink "$@"
 }
 
+test_group_pulsar_connectors_process_java() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process-java.xml -PtestGroups=function "$@"
+  # Keep the original source/sink selections once across the three Process jobs.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=source "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=sink "$@"
+}
+
+test_group_pulsar_connectors_process_python() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process-python.xml -PtestGroups=function "$@"
+}
+
+test_group_pulsar_connectors_process_go() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process-go.xml -PtestGroups=function "$@"
+}
+
 test_group_pulsar_io() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-io-sources.xml -PtestGroups=source "$@"
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-io-sinks.xml -PtestGroups=sink "$@"
