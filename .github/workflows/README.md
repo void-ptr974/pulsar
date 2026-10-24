@@ -63,9 +63,12 @@ flowchart LR
     P[Preconditions] --> B[Prepare Broker test artifacts]
     B --> U[Broker Unit matrix: 12 jobs]
     B --> A[Complete build and source checks]
+    B --> L[Prepare Integration runtime artifacts]
     A --> O[Other Unit matrix: 6 jobs]
     A --> V[Binary license and publication checks]
-    A --> I[Images and Integration/System tests]
+    A --> D[Docker test images]
+    D --> I[Integration/System matrices]
+    L --> I
     A --> M[MacOS build]
     U --> G[All Unit tests completed]
     O --> G
@@ -76,6 +79,23 @@ flowchart LR
     M --> F
     Q --> F
 ```
+
+The Integration artifact producer reuses the Broker artifact while the complete build continues. It prepares
+`:tests:integration:integrationTest` dependencies without running tests, then archives their declared outputs.
+Ordinary Integration groups and all System groups restore `integration-test-build-outputs`; Shade and Native
+Image groups retain `gradle-build-outputs`. Docker images continue to come from the complete build. This reduces
+runner-side transfers without dropping generated resources, shared test JARs or certificate-authority fixtures.
+The one-off manifest collector uses the realized task graph and must run with `--no-configuration-cache`:
+
+```shell
+./gradlew :tests:integration:prepareCiTestArtifacts \
+  --init-script pulsar-build/ci_integration_artifacts.gradle --no-configuration-cache
+./pulsar-build/archive_ci_integration_outputs.sh /tmp/integration-test-build-outputs.tar
+```
+
+Unit jobs initialize JDK and Gradle directly in the workflow before invoking the test and diagnostics composite.
+This keeps Gradle's post-action inputs outside an additional nested composite context. Confirm cache read-only
+behavior and the absence of post-action warnings when validating changes to this setup.
 
 Five Broker groups use two class shards each. `-PtestClassShard=1/2` and `2/2` assign top-level class names by
 CRC32, keeping nested classes together and leaving the runtime classpath intact. TestNG group filters, inherited

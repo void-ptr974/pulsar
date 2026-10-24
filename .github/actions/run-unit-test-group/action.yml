@@ -18,7 +18,7 @@
 #
 
 name: Run unit test group
-description: Run one CI Unit group with the existing diagnostics and report collection
+description: Run one CI Unit group with diagnostics and reports after the caller sets up JDK and Gradle
 inputs:
   group:
     description: Unit group dispatcher name
@@ -26,16 +26,9 @@ inputs:
   name:
     description: Display name of the Unit group
     required: true
-  jdk:
-    description: JDK major version
-    required: true
   build-artifact:
     description: Build outputs artifact and tar basename
     required: true
-  develocity-access-key:
-    description: Optional Develocity access key
-    required: false
-    default: ''
   setup:
     description: Optional trusted setup commands from the workflow
     required: false
@@ -57,17 +50,6 @@ runs:
       continue-on-error: true
       with:
         limit-access-to-actor: true
-
-    - name: Set up JDK ${{ inputs.jdk }}
-      uses: actions/setup-java@v5
-      with:
-        distribution: ${{ env.JDK_DISTRIBUTION }}
-        java-version: ${{ inputs.jdk }}
-
-    - name: Setup Gradle
-      uses: ./.github/actions/setup-gradle
-      with:
-        develocity-access-key: ${{ inputs.develocity-access-key }}
 
     - name: Restore build outputs from build job
       uses: actions/download-artifact@v8

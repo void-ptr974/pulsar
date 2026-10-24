@@ -87,6 +87,14 @@ tasks.test {
     enabled = false
 }
 
+// Build the runner-side test closure without executing container tests or assembling distributions.
+// CI records this task graph's declared outputs in a manifest for the lean test artifact.
+tasks.register("prepareCiTestArtifacts") {
+    group = "build"
+    description = "Build integration-test runtime artifacts without running tests"
+    dependsOn(sourceSets["test"].runtimeClasspath)
+}
+
 // Register a task for each integration test suite
 val integrationTestSuiteFileProperty = providers.gradleProperty("integrationTestSuiteFile")
 val integrationTestSuiteFile = integrationTestSuiteFileProperty.getOrElse("pulsar.xml")
