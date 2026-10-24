@@ -363,13 +363,13 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
+        if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' || github.repository != 'apache/pulsar' }}
         with:
           name: Unit-${{ matrix.group }}-test-reports
           path: |
             test-reports/
             **/build/reports/tests/
-          retention-days: 7
+          retention-days: ${{ job.status == 'success' && github.repository != 'apache/pulsar' && 3 || 7 }}
           if-no-files-found: ignore
 
       - name: Upload possible heap dump, core dump or crash files
@@ -637,13 +637,13 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() }}
+        if: ${{ !success() || github.repository != 'apache/pulsar' }}
         with:
           name: Integration-${{ matrix.upload_name || matrix.group }}-test-reports
           path: |
             test-reports/
             **/build/reports/tests/
-          retention-days: 7
+          retention-days: ${{ job.status == 'success' && github.repository != 'apache/pulsar' && 3 || 7 }}
           if-no-files-found: ignore
 
       - name: Upload possible heap dump, core dump or crash files
@@ -867,13 +867,13 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() }}
+        if: ${{ !success() || github.repository != 'apache/pulsar' }}
         with:
           name: System-${{ matrix.group }}-test-reports
           path: |
             test-reports/
             **/build/reports/tests/
-          retention-days: 7
+          retention-days: ${{ job.status == 'success' && github.repository != 'apache/pulsar' && 3 || 7 }}
           if-no-files-found: ignore
 
       - name: Upload possible heap dump, core dump or crash files
