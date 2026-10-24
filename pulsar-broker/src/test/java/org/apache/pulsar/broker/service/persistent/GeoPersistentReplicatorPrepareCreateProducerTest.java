@@ -29,6 +29,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
+import java.time.Clock;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
@@ -172,6 +173,7 @@ public class GeoPersistentReplicatorPrepareCreateProducerTest {
         when(pulsar.getAdminClient()).thenReturn(localAdmin);
 
         BrokerService brokerService = mock(BrokerService.class);
+        when(brokerService.getClock()).thenReturn(Clock.systemUTC());
         when(brokerService.pulsar()).thenReturn(pulsar);
         when(brokerService.getPulsar()).thenReturn(pulsar);
 

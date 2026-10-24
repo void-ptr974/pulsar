@@ -35,6 +35,7 @@ import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 import io.netty.channel.EventLoopGroup;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -796,6 +797,7 @@ public class PersistentReplicatorInflightTaskTest extends OneWayReplicatorTestBa
         when(pulsar.getAdminClient()).thenReturn(mock(PulsarAdmin.class));
 
         BrokerService brokerService = mock(BrokerService.class);
+        when(brokerService.getClock()).thenReturn(Clock.systemUTC());
         EventLoopGroup executor = mock(EventLoopGroup.class);
         when(brokerService.pulsar()).thenReturn(pulsar);
         when(brokerService.getPulsar()).thenReturn(pulsar);

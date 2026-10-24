@@ -94,7 +94,7 @@ public class NonPersistentReplicator extends AbstractReplicator implements Repli
 
     @SuppressWarnings("unchecked")
     public void sendMessage(Entry entry) {
-        latestPublishTime = System.currentTimeMillis();
+        latestPublishTime = brokerService.getClock().millis();
         if ((STATE_UPDATER.get(this) == State.Started) && isWritable()) {
 
             int length = entry.getLength();

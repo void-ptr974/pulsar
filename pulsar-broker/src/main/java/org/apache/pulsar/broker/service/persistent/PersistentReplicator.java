@@ -305,7 +305,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
         }
 
         // Disconnect if no backlog and no traffic for a long time.
-        if (System.currentTimeMillis() - latestPublishTime > threshold * 1000L) {
+        if (brokerService.getClock().millis() - latestPublishTime > threshold * 1000L) {
             log.info().attr("brokerReplicationInactiveThresholdSeconds", threshold)
                     .log("Disconnecting replication producers since no producer is active for a long time.");
             disconnect();
@@ -455,7 +455,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
                 if (!task.skipReadResultDueToCursorRewind && task.readException == null
                         && state != Started && state != Terminating && state != Terminated) {
                     retryDelayMillis = Math.max(100, estimatedTimeStampProducerConnected
-                            - System.currentTimeMillis() + 100);
+                            - brokerService.getClock().millis() + 100);
                 }
             } else if (rewindRequested) {
                 rewindRequested = false;
@@ -538,12 +538,12 @@ public abstract class PersistentReplicator extends AbstractReplicator
             readRetryScheduled = true;
         }
         try {
-            brokerService.executor().schedule(() -> {
+            scheduleTask(() -> {
                 synchronized (inFlightTasks) {
                     readRetryScheduled = false;
                 }
                 readMoreEntries();
-            }, delayMillis, TimeUnit.MILLISECONDS);
+            }, brokerService.executor(), delayMillis, TimeUnit.MILLISECONDS);
         } catch (Throwable e) {
             synchronized (inFlightTasks) {
                 readRetryScheduled = false;
@@ -566,7 +566,7 @@ public abstract class PersistentReplicator extends AbstractReplicator
                 handleReadFailure(task.readException, task);
                 return;
             }
-            latestPublishTime = System.currentTimeMillis();
+            latestPublishTime = brokerService.getClock().millis();
             if (state == Terminated || state == Terminating || task.skipReadResultDueToCursorRewind) {
                 task.entries.forEach(entry -> discardEntry(entry, null));
                 synchronized (inFlightTasks) {
@@ -919,8 +919,8 @@ public abstract class PersistentReplicator extends AbstractReplicator
         if (ctx instanceof Position) {
             Position deletedEntry = (Position) ctx;
             if (deletedEntry.compareTo(cursor.getMarkDeletedPosition()) > 0) {
-                brokerService.getPulsar().getExecutor().schedule(
-                        () -> cursor.asyncDelete(deletedEntry, this, deletedEntry), 10,
+                scheduleTask(() -> cursor.asyncDelete(deletedEntry, this, deletedEntry),
+                        brokerService.getPulsar().getExecutor(), 10,
                         TimeUnit.SECONDS);
             }
         }

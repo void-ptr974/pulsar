@@ -27,6 +27,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import io.netty.channel.DefaultEventLoop;
 import io.netty.util.internal.DefaultPriorityQueue;
+import java.time.Clock;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -84,6 +85,7 @@ public class AbstractReplicatorTest {
         final ProducerBuilderImpl producerBuilder = mock(ProducerBuilderImpl.class);
         final var topics = new ConcurrentHashMap<String, CompletableFuture<Optional<Topic>>>();
         when(broker.executor()).thenReturn(eventLoopGroup);
+        when(broker.getClock()).thenReturn(Clock.systemUTC());
         when(broker.getTopics()).thenReturn(topics);
         when(remoteClient.newProducer(any(Schema.class))).thenReturn(producerBuilder);
         when(broker.pulsar()).thenReturn(pulsar);
@@ -152,6 +154,7 @@ public class AbstractReplicatorTest {
         final PulsarClientImpl localClient = mock(PulsarClientImpl.class);
         final PulsarClientImpl remoteClient = mock(PulsarClientImpl.class);
         final ProducerBuilderImpl producerBuilder = mock(ProducerBuilderImpl.class);
+        when(broker.getClock()).thenReturn(Clock.systemUTC());
         when(broker.pulsar()).thenReturn(pulsar);
         when(pulsar.getClient()).thenReturn(localClient);
         when(pulsar.getConfiguration()).thenReturn(pulsarConfig);
