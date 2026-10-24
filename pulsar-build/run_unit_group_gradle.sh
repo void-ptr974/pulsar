@@ -61,8 +61,18 @@ echo_and_restore_trace() {
 alias echo='{ [[ $- =~ .*x.* ]] && trace_enabled=1 || trace_enabled=0; set +x; } 2> /dev/null; echo_and_restore_trace'
 
 # Test Groups  -- start --
+# Move these whole broker classes to the shorter group 4. Keep one shared list
+# for inclusion and exclusion so new broker classes remain in group 1 by default.
+readonly BROKER_GROUP_4_TEST_CLASSES=(
+  'org.apache.pulsar.broker.service.BacklogQuotaManagerTest'
+  'org.apache.pulsar.broker.service.BrokerServiceTest'
+  'org.apache.pulsar.broker.transaction.TransactionConsumeTest'
+)
+
 function test_group_broker_group_1() {
-  gradle_test :pulsar-broker:test -PtestGroups='broker'
+  local excluded_classes
+  excluded_classes="$(IFS=,; printf '%s' "${BROKER_GROUP_4_TEST_CLASSES[*]}")"
+  gradle_test :pulsar-broker:test -PtestGroups='broker' -PexcludedTestClasses="$excluded_classes"
   # run broker-isolated test individually
   gradle_test :pulsar-broker:test -PexcludedTestGroups='' \
     --tests 'org.apache.pulsar.broker.stats.prometheus.PrometheusMetricsGeneratorWithNoUnsafeTest'
@@ -83,6 +93,13 @@ function test_group_broker_group_3() {
 
 function test_group_broker_group_4() {
   gradle_test :pulsar-broker:test -PtestGroups='cluster-migration'
+  local moved_tests=()
+  local test_class
+  for test_class in "${BROKER_GROUP_4_TEST_CLASSES[@]}"; do
+    moved_tests+=(--tests "$test_class")
+  done
+  # Keep the broker group filter and its default flaky/quarantine exclusions.
+  gradle_test :pulsar-broker:test -PtestGroups='broker' "${moved_tests[@]}"
 }
 
 function test_group_broker_group_5() {

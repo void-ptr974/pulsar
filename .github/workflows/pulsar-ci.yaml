@@ -147,6 +147,9 @@ jobs:
       - name: checkout
         uses: actions/checkout@v6
 
+      - name: Verify CI test partitions
+        run: python3 pulsar-build/verify_ci_test_partitions.py
+
       - name: Tune Runner VM
         uses: ./.github/actions/tune-runner-vm
 
@@ -333,7 +336,8 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
+        # Keep successful affected-job reports in personal CI for coverage and timing comparisons.
+        if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' || (github.repository != 'apache/pulsar' && (matrix.group == 'BROKER_GROUP_1' || matrix.group == 'BROKER_GROUP_4')) }}
         with:
           name: Unit-${{ matrix.group }}-test-reports
           path: |
@@ -745,8 +749,14 @@ jobs:
           - name: Pulsar Connectors - Thread
             group: PULSAR_CONNECTORS_THREAD
 
-          - name: Pulsar Connectors - Process
-            group: PULSAR_CONNECTORS_PROCESS
+          - name: Pulsar Connectors - Process Java
+            group: PULSAR_CONNECTORS_PROCESS_JAVA
+
+          - name: Pulsar Connectors - Process Python
+            group: PULSAR_CONNECTORS_PROCESS_PYTHON
+
+          - name: Pulsar Connectors - Process Go
+            group: PULSAR_CONNECTORS_PROCESS_GO
 
           - name: Plugin
             group: PLUGIN
@@ -807,7 +817,8 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() }}
+        # Keep successful Process reports in personal CI for coverage and timing comparisons.
+        if: ${{ !success() || (github.repository != 'apache/pulsar' && startsWith(matrix.group, 'PULSAR_CONNECTORS_PROCESS')) }}
         with:
           name: System-${{ matrix.group }}-test-reports
           path: |

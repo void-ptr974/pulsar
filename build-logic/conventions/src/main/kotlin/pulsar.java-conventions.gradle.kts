@@ -222,6 +222,14 @@ tasks.withType<Test>().configureEach {
         val excludedTestGroups = providers.gradleProperty("excludedTestGroups").getOrElse("quarantine,flaky")
         excludeGroups(*(excludedTestGroups.split(",").map { it.trim() }.toTypedArray()))
     }
+    // Whole-class exclusions complement --tests when distributing a TestNG group across CI jobs.
+    providers.gradleProperty("excludedTestClasses").orNull?.let { classes ->
+        filter {
+            classes.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach {
+                excludeTestsMatching(it)
+            }
+        }
+    }
     testLogging {
         events("FAILED")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
