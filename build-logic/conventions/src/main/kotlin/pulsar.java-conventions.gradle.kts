@@ -222,6 +222,12 @@ tasks.withType<Test>().configureEach {
         val excludedTestGroups = providers.gradleProperty("excludedTestGroups").getOrElse("quarantine,flaky")
         excludeGroups(*(excludedTestGroups.split(",").map { it.trim() }.toTypedArray()))
     }
+    // Partition candidate class files, leaving the classpath and TestNG group/method selection intact.
+    // No class inventory is required: newly added classes automatically belong to exactly one shard.
+    providers.gradleProperty("testClassShard").orNull?.let { shard ->
+        inputs.property("testClassShard", shard)
+        exclude(TestClassShardFilter(shard))
+    }
     testLogging {
         events("FAILED")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
