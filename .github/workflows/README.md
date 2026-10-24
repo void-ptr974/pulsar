@@ -51,6 +51,67 @@ done
 
 Duplicate names are allowed, and all checks with the same name will be treated the same (required or not required).
 
+### CI build and test dependencies
+
+`pulsar-ci.yaml` prepares Broker test dependencies before building the complete distribution. Broker Unit jobs
+consume `broker-test-build-outputs`; the remaining Unit jobs, image builds and publication checks consume the
+complete build outputs or wait for the complete build. This lets Broker tests start while distribution assembly
+continues. Binary license and publication validation remain required through the final CI check.
+
+```mermaid
+flowchart LR
+    P[Preconditions] --> B[Prepare Broker test artifacts]
+    B --> U[Broker Unit matrix: 12 jobs]
+    B --> A[Complete build and source checks]
+    B --> L[Prepare Integration runtime artifacts]
+    A --> O[Other Unit matrix: 6 jobs]
+    A --> V[Binary license and publication checks]
+    A --> D[Docker test images]
+    D --> I[Integration/System matrices]
+    L --> I
+    A --> M[MacOS build]
+    U --> G[All Unit tests completed]
+    O --> G
+    G --> Q[CodeQL: existing conditions]
+    G --> F[Final required CI check]
+    V --> F
+    I --> F
+    M --> F
+    Q --> F
+```
+
+The Integration artifact producer reuses the Broker artifact while the complete build continues. It prepares
+`:tests:integration:integrationTest` dependencies without running tests, then archives their declared outputs.
+Ordinary Integration groups and all System groups restore `integration-test-build-outputs`; Shade and Native
+Image groups retain `gradle-build-outputs`. Docker images continue to come from the complete build. This reduces
+runner-side transfers without dropping generated resources, shared test JARs or certificate-authority fixtures.
+The one-off manifest collector uses the realized task graph and must run with `--no-configuration-cache`:
+
+```shell
+./gradlew :tests:integration:prepareCiTestArtifacts \
+  --init-script pulsar-build/ci_integration_artifacts.gradle --no-configuration-cache
+./pulsar-build/archive_ci_integration_outputs.sh /tmp/integration-test-build-outputs.tar
+```
+
+Unit jobs initialize JDK and Gradle directly in the workflow before invoking the test and diagnostics composite.
+This keeps Gradle's post-action inputs outside an additional nested composite context. Confirm cache read-only
+behavior and the absence of post-action warnings when validating changes to this setup.
+
+Five Broker groups use two class shards each. `-PtestClassShard=1/2` and `2/2` assign top-level class names by
+CRC32, keeping nested classes together and leaving the runtime classpath intact. TestNG group filters, inherited
+methods, factories and data providers still apply. The original unsharded dispatcher names remain available for
+local reproduction. Isolated tests are invoked once outside the shard filter. Run
+`python3 pulsar-build/verify_ci_broker_shards.py` and `python3 pulsar-build/verify_ci_test_partitions.py` to check the
+dispatcher and suite partitions without Docker. The Gradle/TestNG fixture can also be run with
+`python3 pulsar-build/tests/test_ci_test_class_shards.py`.
+
+The build output archives exclude `.gradle` directories. Gradle caches are managed separately by `setup-gradle`;
+a cold or incompatible cache can still cause compilation after an archive is restored. Compare actual compilation
+steps, artifact transfer time, queue time and accumulated runner minutes when assessing the benefit. CRC32 gives
+a stable initial assignment, but class counts do not guarantee equal test duration. Use successful test XML reports
+retained in personal CI to measure the next balancing change against the same-revision baseline. Overall CI time
+is measured through the final required check, including CodeQL and publication validation.
+
 When working on workflow changes, one way to find out the names of the status checks is to retrieve the names
 from the PR build run. The "check-runs" can be found by commit id. Here's an example:
 

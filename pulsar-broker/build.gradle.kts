@@ -168,6 +168,15 @@ dependencies {
     testExamplesJar(project(":pulsar-functions:pulsar-functions-api-examples"))
 }
 
+// Prepare the same inputs as the broker Test task without running tests or assembling distributions.
+// The runtime classpath carries the build dependencies for main/test classes, resources and shared
+// test JARs; the extra archives below are also required by Test's explicit dependsOn declaration.
+tasks.register("prepareCiTestArtifacts") {
+    group = "build"
+    description = "Prepares all broker test inputs without executing tests."
+    dependsOn(sourceSets["test"].runtimeClasspath, testNars, testExamplesJar)
+}
+
 tasks.withType<Test> {
     dependsOn(testNars, testExamplesJar)
     val narFiles = testNars.incoming.artifacts.resolvedArtifacts

@@ -1,0 +1,131 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: Run unit test group
+description: Run one CI Unit group with diagnostics and reports after the caller sets up JDK and Gradle
+inputs:
+  group:
+    description: Unit group dispatcher name
+    required: true
+  name:
+    description: Display name of the Unit group
+    required: true
+  build-artifact:
+    description: Build outputs artifact and tar basename
+    required: true
+  setup:
+    description: Optional trusted setup commands from the workflow
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Tune Runner VM
+      uses: ./.github/actions/tune-runner-vm
+
+    - name: Clean Disk when tracing test resource cleanup
+      if: ${{ env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
+      uses: ./.github/actions/clean-disk
+
+    - name: Setup ssh access to build runner VM
+      # ssh access is enabled for builds in own forks
+      if: ${{ github.repository != 'apache/pulsar' && github.event_name == 'pull_request' }}
+      uses: ./.github/actions/ssh-access
+      continue-on-error: true
+      with:
+        limit-access-to-actor: true
+
+    - name: Restore build outputs from build job
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ inputs.build-artifact }}
+
+    - name: Extract build outputs
+      shell: bash
+      run: tar xf "${{ inputs.build-artifact }}.tar"
+
+    - name: Run setup commands
+      if: ${{ inputs.setup }}
+      shell: bash
+      run: |
+        ${{ inputs.setup }}
+
+    - name: Run unit test group '${{ inputs.group }}'
+      shell: bash
+      run: |
+        ./pulsar-build/run_unit_group_gradle.sh ${{ inputs.group }}
+
+    - name: print JVM thread dumps when cancelled
+      if: cancelled()
+      shell: bash
+      run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh print_thread_dumps
+
+    - name: Aggregate test reports to ./test-reports directory
+      if: ${{ always() }}
+      uses: ./.github/actions/copy-test-reports
+
+    - name: Report detected thread leaks
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        if [ -d "$THREAD_LEAK_DETECTOR_DIR" ]; then
+          cd "$THREAD_LEAK_DETECTOR_DIR"
+          cat threadleak*.txt | awk '/^Summary:/ {print "::warning::" $0 "\n"; next} {print}'
+        fi
+
+    - name: Report detected Netty leaks
+      if: ${{ always() && env.NETTY_LEAK_DETECTION != 'off' }}
+      shell: bash
+      run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+
+    - name: Upload test reports
+      uses: actions/upload-artifact@v7
+      # Keep successful affected-job reports in personal CI for coverage and timing comparisons.
+      if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' || github.repository != 'apache/pulsar' }}
+      with:
+        name: Unit-${{ inputs.group }}-test-reports
+        path: |
+          test-reports/
+          **/build/reports/tests/
+        retention-days: ${{ job.status == 'success' && github.repository != 'apache/pulsar' && 3 || 7 }}
+        if-no-files-found: ignore
+
+    - name: Upload possible heap dump, core dump or crash files
+      uses: actions/upload-artifact@v7
+      if: ${{ always() }}
+      with:
+        name: Unit-${{ inputs.group }}-dumps
+        path: |
+          /tmp/*.hprof
+          **/hs_err_*.log
+          **/core.*
+          build/threaddumps/
+          ${{ env.NETTY_LEAK_DUMP_DIR }}/*
+          ${{ env.TRACE_TEST_RESOURCE_CLEANUP_DIR }}/*
+          ${{ env.THREAD_LEAK_DETECTOR_DIR }}/*
+        retention-days: 7
+        if-no-files-found: ignore
+
+    - name: Wait for ssh connection when build fails
+      # ssh access is enabled for builds in own forks
+      uses: ./.github/actions/ssh-access
+      if: ${{ failure() && github.repository != 'apache/pulsar' && github.event_name == 'pull_request' }}
+      continue-on-error: true
+      with:
+        action: wait
