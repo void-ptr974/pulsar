@@ -37,6 +37,7 @@ import com.google.common.util.concurrent.UncheckedExecutionException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.EventLoopGroup;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -212,6 +213,7 @@ public class GeoPersistentReplicatorTest {
             ServiceConfiguration config = new ServiceConfiguration();
             PulsarService pulsar = mock(PulsarService.class);
             BrokerService brokerService = mock(BrokerService.class);
+            when(brokerService.getClock()).thenReturn(Clock.systemUTC());
             PulsarClientImpl localClient = mockLocalClient(schemaLookupFailure);
             PulsarAdmin admin = mock(PulsarAdmin.class);
 

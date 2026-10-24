@@ -24,6 +24,7 @@ import io.opentelemetry.api.common.Attributes;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import lombok.Getter;
@@ -86,7 +87,7 @@ public abstract class AbstractReplicator implements Replicator {
     private static final AtomicReferenceFieldUpdater<AbstractReplicator, Attributes> ATTRIBUTES_UPDATER =
             AtomicReferenceFieldUpdater.newUpdater(AbstractReplicator.class, Attributes.class, "attributes");
 
-    protected volatile long latestPublishTime = System.currentTimeMillis();
+    protected volatile long latestPublishTime;
 
     // The estimated time when the producer connection is successful, "0" means it will be connected immediately.
     protected volatile long estimatedTimeStampProducerConnected = 0;
@@ -120,6 +121,7 @@ public abstract class AbstractReplicator implements Replicator {
                               PulsarAdmin replicationAdmin)
             throws PulsarServerException {
         this.brokerService = brokerService;
+        this.latestPublishTime = brokerService.getClock().millis();
         this.localTopic = localTopic;
         this.localTopicName = localTopic.getName();
         this.replicatorPrefix = replicatorPrefix;
@@ -158,6 +160,12 @@ public abstract class AbstractReplicator implements Replicator {
                 .maxPendingMessages(producerQueueSize) //
                 .producerName(getProducerName());
         STATE_UPDATER.set(this, State.Disconnected);
+    }
+
+    /** Allows tests to control retry timing while retaining each task's executor and delay by default. */
+    @VisibleForTesting
+    protected void scheduleTask(Runnable task, ScheduledExecutorService executor, long delay, TimeUnit unit) {
+        executor.schedule(task, delay, unit);
     }
 
     protected abstract String getProducerName();
@@ -224,7 +232,7 @@ public abstract class AbstractReplicator implements Replicator {
             Pair<Boolean, State> setDisconnectedRes = compareSetAndGetState(State.Starting, State.Disconnected);
             if (setDisconnectedRes.getLeft()) {
                 long waitTimeMs = backOff.next().toMillis();
-                estimatedTimeStampProducerConnected = System.currentTimeMillis() + waitTimeMs;
+                estimatedTimeStampProducerConnected = brokerService.getClock().millis() + waitTimeMs;
                 log.warn()
                         .exceptionMessage(ex)
                         .attr("waitTimeSec", waitTimeMs / 1000.0)
@@ -260,7 +268,7 @@ public abstract class AbstractReplicator implements Replicator {
     }
 
     protected void scheduleCheckTopicActiveAndStartProducer(final long waitTimeMs) {
-        brokerService.executor().schedule(() -> {
+        scheduleTask(() -> {
             if (state == State.Terminating || state == State.Terminated) {
                 log.info("Skip scheduled to start the producer since the replicator is terminating");
                 return;
@@ -301,7 +309,7 @@ public abstract class AbstractReplicator implements Replicator {
                 terminate();
                 return null;
             });
-        }, waitTimeMs, TimeUnit.MILLISECONDS);
+        }, brokerService.executor(), waitTimeMs, TimeUnit.MILLISECONDS);
     }
 
     protected CompletableFuture<Boolean> isLocalTopicActive() {
@@ -371,7 +379,7 @@ public abstract class AbstractReplicator implements Replicator {
                      *     creation and call "inProgressCreationFuture.thenApply(closeProducer())".
                      */
                     long waitTimeMs = backOff.next().toMillis();
-                    brokerService.executor().schedule(() -> closeProducerAsync(true),
+                    scheduleTask(() -> closeProducerAsync(true), brokerService.executor(),
                             waitTimeMs, TimeUnit.MILLISECONDS);
                 } else {
                     log.info("Skip current producer closing since the previous producer has been closed "
@@ -418,7 +426,7 @@ public abstract class AbstractReplicator implements Replicator {
                     .attr("waitTimeSec", waitTimeMs / 1000.0)
                     .log("Exception occurred while trying to close the producer, retrying");
             // BackOff before retrying
-            brokerService.executor().schedule(() -> doCloseProducerAsync(producer, actionAfterClosed),
+            scheduleTask(() -> doCloseProducerAsync(producer, actionAfterClosed), brokerService.executor(),
                     waitTimeMs, TimeUnit.MILLISECONDS);
             return null;
         });

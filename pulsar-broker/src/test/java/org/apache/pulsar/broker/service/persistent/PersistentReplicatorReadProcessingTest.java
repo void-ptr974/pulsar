@@ -32,6 +32,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import io.netty.channel.EventLoopGroup;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -975,6 +976,7 @@ public class PersistentReplicatorReadProcessingTest {
         when(pulsar.getAdminClient()).thenReturn(mock(PulsarAdmin.class));
 
         BrokerService brokerService = mock(BrokerService.class);
+        when(brokerService.getClock()).thenReturn(Clock.systemUTC());
         EventLoopGroup executor = mock(EventLoopGroup.class);
         Queue<Runnable> queuedWork = new ConcurrentLinkedQueue<>();
         Queue<ScheduledWork> scheduledWork = new ConcurrentLinkedQueue<>();

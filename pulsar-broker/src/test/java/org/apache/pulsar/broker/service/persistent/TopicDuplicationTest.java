@@ -21,6 +21,8 @@ package org.apache.pulsar.broker.service.persistent;
 import static org.apache.pulsar.broker.service.persistent.PersistentTopic.DEDUPLICATION_CURSOR_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotEquals;
@@ -38,14 +40,18 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import lombok.Cleanup;
+import org.apache.bookkeeper.mledger.AsyncCallbacks.MarkDeleteCallback;
 import org.apache.bookkeeper.mledger.ManagedCursor;
+import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
 import org.apache.pulsar.broker.BrokerTestUtil;
 import org.apache.pulsar.broker.service.BrokerService;
 import org.apache.pulsar.broker.service.Topic;
+import org.apache.pulsar.broker.testinterceptor.BrokerTestInterceptor;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.InjectedClientCnxClientBuilder;
 import org.apache.pulsar.client.api.Message;
@@ -62,6 +68,7 @@ import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.client.impl.metrics.InstrumentProvider;
 import org.apache.pulsar.common.api.proto.CommandSendReceipt;
 import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.utils.TestLogAppender;
 import org.awaitility.Awaitility;
 import org.awaitility.reflect.WhiteboxImpl;
 import org.testng.Assert;
@@ -430,6 +437,97 @@ public class TopicDuplicationTest extends ProducerConsumerBase {
             assertNotEquals(position, markDeletedPosition);
         }
 
+    }
+
+    @Test(timeOut = 120_000)
+    public void testPeriodicSnapshotCatchesUpAfterOverlappingSnapshot() throws Exception {
+        int previousFrequency = conf.getBrokerDeduplicationSnapshotFrequencyInSeconds();
+        int previousInterval = conf.getBrokerDeduplicationSnapshotIntervalSeconds();
+        int previousEntriesInterval = conf.getBrokerDeduplicationEntriesInterval();
+        String previousTopicFactory = conf.getTopicFactoryClassName();
+        String previousStorageClass = conf.getManagedLedgerStorageClassName();
+        var interceptor = BrokerTestInterceptor.INSTANCE;
+        var previousCursorDecorator = interceptor.getManagedCursorDecorator();
+        CompletableFuture<Void> releaseFirstSnapshot = new CompletableFuture<>();
+        CompletableFuture<Position> heldSnapshotPosition = new CompletableFuture<>();
+        AtomicInteger markDeleteCalls = new AtomicInteger();
+        String topicName = testTopic + UUID.randomUUID();
+        try {
+            cleanup();
+            conf.setBrokerDeduplicationSnapshotFrequencyInSeconds(1);
+            // Disable periodic snapshots until the entry-count snapshots have overlapped.
+            conf.setBrokerDeduplicationSnapshotIntervalSeconds(0);
+            conf.setBrokerDeduplicationEntriesInterval(2);
+            interceptor.configure(conf);
+            interceptor.applyCursorSpyDecorator(cursor -> {
+                if (!DEDUPLICATION_CURSOR_NAME.equals(cursor.getName())
+                        || !TopicName.get(topicName).getPersistenceNamingEncoding()
+                                .equals(cursor.getManagedLedger().getName())) {
+                    return;
+                }
+                doAnswer(invocation -> {
+                    if (markDeleteCalls.incrementAndGet() != 1) {
+                        return invocation.callRealMethod();
+                    }
+                    heldSnapshotPosition.complete(invocation.getArgument(0));
+                    releaseFirstSnapshot.thenRun(() ->
+                            ((ManagedLedgerImpl) cursor.getManagedLedger()).getExecutor().execute(() -> {
+                                try {
+                                    invocation.callRealMethod();
+                                } catch (Throwable error) {
+                                    MarkDeleteCallback callback = invocation.getArgument(2);
+                                    callback.markDeleteFailed(new ManagedLedgerException(error),
+                                            invocation.getArgument(3));
+                                }
+                            }));
+                    return null;
+                }).when(cursor).asyncMarkDelete(any(Position.class), any(), any(MarkDeleteCallback.class), any());
+            });
+            setup();
+            try (Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(topicName)
+                    .enableBatching(false).producerName("overlapping-snapshot").create();
+                 TestLogAppender appender = TestLogAppender.create(MessageDeduplication.class)) {
+                PersistentTopic topic = (PersistentTopic) pulsar.getBrokerService()
+                        .getTopicIfExists(topicName).get().orElseThrow();
+                ManagedCursor cursor = topic.getMessageDeduplication().getManagedCursor();
+                producer.send("one");
+                producer.send("two");
+                Position firstPosition = heldSnapshotPosition.get(10, TimeUnit.SECONDS);
+                producer.send("three");
+                producer.send("four");
+                Position lastPosition = topic.getManagedLedger().getLastConfirmedEntry();
+                assertThat(lastPosition.compareTo(firstPosition)).isPositive();
+                assertThat(markDeleteCalls.get()).as("overlapping entry-count snapshot must be skipped").isOne();
+                assertThat(appender.getEvents()).anySatisfy(event -> assertThat(
+                        event.getMessage().getFormattedMessage()).contains(
+                        "There is a pending snapshot when taking snapshot for"));
+                assertThat(cursor.getMarkDeletedPosition().compareTo(firstPosition))
+                        .as("held snapshot must not have advanced its cursor").isNegative();
+
+                releaseFirstSnapshot.complete(null);
+                Awaitility.await().untilAsserted(() ->
+                        assertThat(cursor.getMarkDeletedPosition()).isEqualTo(firstPosition));
+                assertThat(markDeleteCalls.get()).as("periodic snapshots remain disabled").isOne();
+                admin.topicPolicies().setDeduplicationSnapshotInterval(topicName, 1);
+                Awaitility.await().untilAsserted(() -> {
+                    assertThat(cursor.getMarkDeletedPosition()).isEqualTo(lastPosition);
+                    assertThat(markDeleteCalls.get()).as("real periodic monitor must catch up").isGreaterThan(1);
+                });
+            }
+        } finally {
+            releaseFirstSnapshot.complete(null);
+            try {
+                cleanup();
+            } finally {
+                interceptor.setManagedCursorDecorator(previousCursorDecorator);
+                conf.setBrokerDeduplicationSnapshotFrequencyInSeconds(previousFrequency);
+                conf.setBrokerDeduplicationSnapshotIntervalSeconds(previousInterval);
+                conf.setBrokerDeduplicationEntriesInterval(previousEntriesInterval);
+                conf.setTopicFactoryClassName(previousTopicFactory);
+                conf.setManagedLedgerStorageClassName(previousStorageClass);
+                setup();
+            }
+        }
     }
 
     @Test(timeOut = 30000)

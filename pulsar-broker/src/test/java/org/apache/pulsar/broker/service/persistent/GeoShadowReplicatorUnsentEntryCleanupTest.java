@@ -35,6 +35,7 @@ import static org.mockito.Mockito.when;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.EventLoopGroup;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -222,6 +223,7 @@ public class GeoShadowReplicatorUnsentEntryCleanupTest {
         when(pulsar.getAdminClient()).thenReturn(mock(PulsarAdmin.class));
 
         BrokerService brokerService = mock(BrokerService.class);
+        when(brokerService.getClock()).thenReturn(Clock.systemUTC());
         when(brokerService.pulsar()).thenReturn(pulsar);
         when(brokerService.getPulsar()).thenReturn(pulsar);
         EventLoopGroup executor = mock(EventLoopGroup.class);
