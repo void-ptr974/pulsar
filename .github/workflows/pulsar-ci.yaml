@@ -134,8 +134,181 @@ jobs:
           github.event_name == 'workflow_dispatch' && github.event.inputs.netty_leak_detection || 'report'
           }}" >> $GITHUB_OUTPUT
 
-  build-and-license-check:
+  broker-test-artifacts:
+    name: Prepare Broker test artifacts
     needs: preconditions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    env:
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Verify CI test partitions
+        run: |
+          python3 pulsar-build/verify_ci_test_partitions.py
+          python3 pulsar-build/verify_ci_broker_shards.py
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK ${{ env.CI_JDK_MAJOR_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: false
+
+      - name: Prepare complete Broker test dependencies without executing tests
+        run: ./gradlew :pulsar-broker:prepareCiTestArtifacts --no-configuration-cache
+
+      - name: Save Broker test build outputs
+        run: ./pulsar-build/archive_ci_build_outputs.sh /tmp/broker-test-build-outputs.tar
+
+      - name: Upload Broker test build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: broker-test-build-outputs
+          path: /tmp/broker-test-build-outputs.tar
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: 1
+
+  integration-test-artifacts:
+    name: Prepare Integration test artifacts
+    needs: [preconditions, broker-test-artifacts]
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK ${{ env.CI_JDK_MAJOR_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: false
+
+      - name: Restore Broker producer build outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: broker-test-build-outputs
+
+      - name: Extract Broker producer build outputs
+        run: tar xf broker-test-build-outputs.tar
+
+      - name: Prepare Integration runtime without running tests
+        run: >-
+          ./gradlew :tests:integration:prepareCiTestArtifacts
+          --init-script pulsar-build/ci_integration_artifacts.gradle
+          --no-configuration-cache
+
+      - name: Save Integration test build outputs
+        run: ./pulsar-build/archive_ci_integration_outputs.sh /tmp/integration-test-build-outputs.tar
+
+      - name: Upload Integration test build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-test-build-outputs
+          path: /tmp/integration-test-build-outputs.tar
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: 1
+
+      - name: Upload Gradle reports
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gradle-reports-integration-test-artifacts
+          path: '**/build/reports/'
+          retention-days: 7
+          if-no-files-found: ignore
+
+  other-unit-test-artifacts:
+    name: Prepare other Unit test artifacts
+    needs: [preconditions, broker-test-artifacts]
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK ${{ env.CI_JDK_MAJOR_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: false
+
+      - name: Restore Broker producer build outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: broker-test-build-outputs
+
+      - name: Extract Broker producer build outputs
+        run: tar xf broker-test-build-outputs.tar
+
+      - name: Prepare default Unit dependencies without running tests
+        run: >-
+          ./gradlew prepareCiUnitTestArtifacts
+          -x :pulsar-broker:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-admin-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-all-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-shade-test:prepareCiUnitTestArtifacts
+          -x :tests:pulsar-client-native-image:prepareCiUnitTestArtifacts
+          --init-script pulsar-build/ci_unit_artifacts.gradle
+          --no-configuration-cache
+
+      - name: Save other Unit test build outputs
+        run: ./pulsar-build/archive_ci_unit_outputs.sh /tmp/unit-test-build-outputs.tar
+
+      - name: Upload other Unit test build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-build-outputs
+          path: /tmp/unit-test-build-outputs.tar
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: 1
+
+      - name: Upload Gradle reports
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gradle-reports-other-unit-test-artifacts
+          path: '**/build/reports/'
+          retention-days: 7
+          if-no-files-found: ignore
+
+  build-and-license-check:
+    needs: [preconditions, broker-test-artifacts]
     name: Build and License check
     env:
       JOB_NAME: Build and License check
@@ -146,6 +319,9 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6
+
+      - name: Verify CI test partitions
+        run: python3 pulsar-build/verify_ci_test_partitions.py
 
       - name: Tune Runner VM
         uses: ./.github/actions/tune-runner-vm
@@ -170,16 +346,18 @@ jobs:
           develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
           cache-read-only: false
 
+      - name: Restore Broker producer build outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: broker-test-build-outputs
+
+      - name: Extract Broker producer build outputs
+        run: tar xf broker-test-build-outputs.tar
+
       - name: Build, check licenses and code style
         run: >-
           ./gradlew assemble rat spotlessCheck checkstyleMain checkstyleTest
           --no-configuration-cache
-
-      - name: Check binary licenses
-        run: ./gradlew checkBinaryLicense --no-configuration-cache
-
-      - name: Check that project's public libraries can be published to a Maven repository
-        run: ./gradlew publishAllPublicationsToLocalDeployRepository
 
       - name: Upload Gradle reports
         uses: actions/upload-artifact@v4
@@ -192,12 +370,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Save build outputs for test jobs
-        run: |
-          # Tar up compiled classes, resources, and distribution archives so test jobs
-          # don't need to recompile. Distribution tarballs are needed for Docker image builds.
-          find . \( -path '*/build/classes/*' -o -path '*/build/generated/*' -o -path '*/build/resources/*' \
-            -o -path '*/build/libs/*' -o -path '*/build/tmp/jar/*' -o -path '*/build/distributions/*' \) -print \
-            | tar cf /tmp/gradle-build-outputs.tar --files-from=-
+        run: ./pulsar-build/archive_ci_build_outputs.sh /tmp/gradle-build-outputs.tar
 
       - name: Upload build outputs
         uses: actions/upload-artifact@v7
@@ -216,7 +389,56 @@ jobs:
           action: wait
 
 
-  unit-tests:
+  publication-checks:
+    name: Binary license and publication checks
+    needs: [preconditions, build-and-license-check]
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK ${{ env.CI_JDK_MAJOR_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+      - name: Restore complete build outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: gradle-build-outputs
+
+      - name: Extract build outputs
+        run: tar xf gradle-build-outputs.tar
+
+      - name: Check binary licenses
+        run: ./gradlew checkBinaryLicense --no-configuration-cache
+
+      - name: Check that project's public libraries can be published to a Maven repository
+        run: ./gradlew publishAllPublicationsToLocalDeployRepository
+
+      - name: Upload Gradle reports
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gradle-reports-publication-checks
+          path: '**/build/reports/'
+          retention-days: 7
+          if-no-files-found: ignore
+
+  unit-tests-broker:
     name: CI - Unit - ${{ matrix.name }}
     env:
       JOB_NAME: CI - Unit - ${{ matrix.name }}
@@ -229,7 +451,74 @@ jobs:
       NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout || 60 }}
-    needs: ['preconditions', 'build-and-license-check']
+    needs: ['preconditions', 'broker-test-artifacts']
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Brokers - Broker Group 1 - Shard 1 of 2
+            group: BROKER_GROUP_1_SHARD_1
+          - name: Brokers - Broker Group 1 - Shard 2 of 2
+            group: BROKER_GROUP_1_SHARD_2
+          - name: Brokers - Broker Group 2 - Shard 1 of 2
+            group: BROKER_GROUP_2_SHARD_1
+          - name: Brokers - Broker Group 2 - Shard 2 of 2
+            group: BROKER_GROUP_2_SHARD_2
+          - name: Brokers - Broker Group 3
+            group: BROKER_GROUP_3
+            timeout: 75
+          - name: Brokers - Broker Group 4
+            group: BROKER_GROUP_4
+          - name: Brokers - Broker Group 5 - Shard 1 of 2
+            group: BROKER_GROUP_5_SHARD_1
+          - name: Brokers - Broker Group 5 - Shard 2 of 2
+            group: BROKER_GROUP_5_SHARD_2
+          - name: Brokers - Client Api - Shard 1 of 2
+            group: BROKER_CLIENT_API_SHARD_1
+          - name: Brokers - Client Api - Shard 2 of 2
+            group: BROKER_CLIENT_API_SHARD_2
+          - name: Brokers - Client Impl - Shard 1 of 2
+            group: BROKER_CLIENT_IMPL_SHARD_1
+          - name: Brokers - Client Impl - Shard 2 of 2
+            group: BROKER_CLIENT_IMPL_SHARD_2
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ needs.preconditions.outputs.jdk_major_version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ needs.preconditions.outputs.jdk_major_version }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+      - name: Run Unit group with diagnostics
+        uses: ./.github/actions/run-unit-test-group
+        with:
+          group: ${{ matrix.group }}
+          name: ${{ matrix.name }}
+          build-artifact: broker-test-build-outputs
+
+  unit-tests-other:
+    name: CI - Unit - ${{ matrix.name }}
+    env:
+      JOB_NAME: CI - Unit - ${{ matrix.name }}
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+      TRACE_TEST_RESOURCE_CLEANUP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trace_test_resource_cleanup || 'off' }}
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.thread_leak_detector_wait_millis || 10000 }}
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: "${{ needs.preconditions.outputs.netty_leak_detection }}"
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout || 60 }}
+    needs: ['preconditions', 'other-unit-test-artifacts']
     if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
     strategy:
       fail-fast: false
@@ -238,21 +527,6 @@ jobs:
           - name: Other
             group: OTHER
             timeout: 75
-          - name: Brokers - Broker Group 1
-            group: BROKER_GROUP_1
-          - name: Brokers - Broker Group 2
-            group: BROKER_GROUP_2
-          - name: Brokers - Broker Group 3
-            group: BROKER_GROUP_3
-            timeout: 75
-          - name: Brokers - Broker Group 4
-            group: BROKER_GROUP_4
-          - name: Brokers - Broker Group 5
-            group: BROKER_GROUP_5
-          - name: Brokers - Client Api
-            group: BROKER_CLIENT_API
-          - name: Brokers - Client Impl
-            group: BROKER_CLIENT_IMPL
           - name: Proxy
             group: PROXY
           - name: Pulsar IO
@@ -261,6 +535,49 @@ jobs:
             group: CLIENT
           - name: Pulsar Metadata
             group: METADATA
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ needs.preconditions.outputs.jdk_major_version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ needs.preconditions.outputs.jdk_major_version }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+      - name: Run Unit group with diagnostics
+        uses: ./.github/actions/run-unit-test-group
+        with:
+          group: ${{ matrix.group }}
+          name: ${{ matrix.name }}
+          build-artifact: unit-test-build-outputs
+
+  # Keep the protobuf-v3 rebuild isolated from default protobuf-v4 artifacts.
+  unit-tests-protobufv3:
+    name: CI - Unit - ${{ matrix.name }}
+    env:
+      JOB_NAME: CI - Unit - ${{ matrix.name }}
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+      TRACE_TEST_RESOURCE_CLEANUP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trace_test_resource_cleanup || 'off' }}
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.thread_leak_detector_wait_millis || 10000 }}
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: "${{ needs.preconditions.outputs.netty_leak_detection }}"
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: ['preconditions', 'build-and-license-check']
+    if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - name: Protobuf v3
             group: PROTOBUFV3
 
@@ -268,103 +585,38 @@ jobs:
       - name: checkout
         uses: actions/checkout@v6
 
-      - name: Tune Runner VM
-        uses: ./.github/actions/tune-runner-vm
-
-      - name: Clean Disk when tracing test resource cleanup
-        if: ${{ env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
-        uses: ./.github/actions/clean-disk
-
-      - name: Setup ssh access to build runner VM
-        # ssh access is enabled for builds in own forks
-        if: ${{ github.repository != 'apache/pulsar' && github.event_name == 'pull_request' }}
-        uses: ./.github/actions/ssh-access
-        continue-on-error: true
-        with:
-          limit-access-to-actor: true
-
-      - name: Set up JDK ${{ matrix.jdk || env.CI_JDK_MAJOR_VERSION }}
+      - name: Set up JDK ${{ needs.preconditions.outputs.jdk_major_version }}
         uses: actions/setup-java@v5
         with:
           distribution: ${{ env.JDK_DISTRIBUTION }}
-          java-version: ${{ matrix.jdk || env.CI_JDK_MAJOR_VERSION }}
+          java-version: ${{ needs.preconditions.outputs.jdk_major_version }}
 
       - name: Setup Gradle
         uses: ./.github/actions/setup-gradle
         with:
           develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
 
-      - name: Restore build outputs from build job
-        uses: actions/download-artifact@v8
+      - name: Run Unit group with diagnostics
+        uses: ./.github/actions/run-unit-test-group
         with:
-          name: gradle-build-outputs
+          group: ${{ matrix.group }}
+          name: ${{ matrix.name }}
+          build-artifact: gradle-build-outputs
 
-      - name: Extract build outputs
-        run: tar xf gradle-build-outputs.tar
-
-      - name: Run setup commands
-        if: ${{ matrix.setup }}
+  # Preserve the existing all-Unit dependency used by CodeQL and the final gate.
+  unit-tests:
+    name: All Unit tests completed
+    needs: [preconditions, unit-tests-broker, unit-tests-other, unit-tests-protobufv3]
+    if: ${{ always() && needs.preconditions.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require all Unit groups to succeed
         run: |
-          ${{ matrix.setup }}
-
-      - name: Run unit test group '${{ matrix.group }}'
-        run: |
-          ./pulsar-build/run_unit_group_gradle.sh ${{ matrix.group }}
-
-      - name: print JVM thread dumps when cancelled
-        if: cancelled()
-        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh print_thread_dumps
-
-      - name: Aggregate test reports to ./test-reports directory
-        if: ${{ always() }}
-        uses: ./.github/actions/copy-test-reports
-
-      - name: Report detected thread leaks
-        if: ${{ always() }}
-        run: |
-          if [ -d "$THREAD_LEAK_DETECTOR_DIR" ]; then
-            cd "$THREAD_LEAK_DETECTOR_DIR"
-            cat threadleak*.txt | awk '/^Summary:/ {print "::warning::" $0 "\n"; next} {print}'
-          fi
-
-      - name: Report detected Netty leaks
-        if: ${{ always() && env.NETTY_LEAK_DETECTION != 'off' }}
-        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
-
-      - name: Upload test reports
-        uses: actions/upload-artifact@v7
-        if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
-        with:
-          name: Unit-${{ matrix.group }}-test-reports
-          path: |
-            test-reports/
-            **/build/reports/tests/
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Upload possible heap dump, core dump or crash files
-        uses: actions/upload-artifact@v7
-        if: ${{ always() }}
-        with:
-          name: Unit-${{ matrix.group }}-dumps
-          path: |
-            /tmp/*.hprof
-            **/hs_err_*.log
-            **/core.*
-            build/threaddumps/
-            ${{ env.NETTY_LEAK_DUMP_DIR }}/*
-            ${{ env.TRACE_TEST_RESOURCE_CLEANUP_DIR }}/*
-            ${{ env.THREAD_LEAK_DETECTOR_DIR }}/*
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Wait for ssh connection when build fails
-        # ssh access is enabled for builds in own forks
-        uses: ./.github/actions/ssh-access
-        if: ${{ failure() && github.repository != 'apache/pulsar' && github.event_name == 'pull_request' }}
-        continue-on-error: true
-        with:
-          action: wait
+          [[ "${{ needs.preconditions.result }}" == "success" \
+          && "${{ needs.unit-tests-broker.result }}" == "success" \
+          && "${{ needs.unit-tests-other.result }}" == "success" \
+          && "${{ needs.unit-tests-protobufv3.result }}" == "success" ]]
 
   macos-build:
     name: Build Pulsar on MacOS
@@ -462,7 +714,7 @@ jobs:
     name: CI - Integration - ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout || 60 }}
-    needs: ['preconditions', 'pulsar-java-test-image']
+    needs: ['preconditions', 'pulsar-java-test-image', 'integration-test-artifacts']
     if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
     env:
       JOB_NAME: CI - Integration - ${{ matrix.name }}
@@ -475,11 +727,20 @@ jobs:
           - name: Backwards Compatibility
             group: BACKWARDS_COMPAT
 
-          - name: Cli
-            group: CLI
+          - name: Cli - Admin
+            group: CLI_ADMIN
 
-          - name: Messaging
-            group: MESSAGING
+          - name: Cli - Tools
+            group: CLI_TOOLS
+
+          - name: Messaging - Smoke
+            group: MESSAGING_SMOKE
+
+          - name: Messaging - Topic
+            group: MESSAGING_TOPIC
+
+          - name: Messaging - Other
+            group: MESSAGING_OTHER
 
           - name: LoadBalance
             group: LOADBALANCE
@@ -487,16 +748,19 @@ jobs:
           - name: Shade on Java 17
             group: SHADE_RUN
             upload_name: SHADE_RUN_17
+            build_artifact: gradle-build-outputs
             runtime_jdk: 17
 
           - name: Shade on Java 21
             group: SHADE_RUN
             upload_name: SHADE_RUN_21
+            build_artifact: gradle-build-outputs
             runtime_jdk: 21
 
           - name: Shade on Java 25
             group: SHADE_RUN
             upload_name: SHADE_RUN_25
+            build_artifact: gradle-build-outputs
             runtime_jdk: 25
 
           - name: Standalone
@@ -516,6 +780,7 @@ jobs:
 
           - name: Native Image
             group: NATIVE_IMAGE
+            build_artifact: gradle-build-outputs
             runtime_jdk: 25
             # Native image compilation (even in quick build mode) is slower than a
             # regular test group, so allow extra headroom over the default timeout.
@@ -561,10 +826,10 @@ jobs:
       - name: Restore build outputs from build job
         uses: actions/download-artifact@v8
         with:
-          name: gradle-build-outputs
+          name: ${{ matrix.build_artifact || 'integration-test-build-outputs' }}
 
       - name: Extract build outputs
-        run: tar xf gradle-build-outputs.tar
+        run: tar xf "${{ matrix.build_artifact || 'integration-test-build-outputs' }}.tar"
 
       - name: Download docker image
         uses: actions/download-artifact@v8
@@ -574,11 +839,6 @@ jobs:
 
       - name: Load docker image
         run: docker load -i /tmp/java-test-image.tar.gz
-
-      - name: Run setup commands
-        if: ${{ matrix.setup }}
-        run: |
-          ${{ matrix.setup }}
 
       - name: Run integration test group '${{ matrix.group }}'
         run: |
@@ -594,13 +854,13 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() }}
+        if: ${{ !success() || github.repository != 'apache/pulsar' }}
         with:
           name: Integration-${{ matrix.upload_name || matrix.group }}-test-reports
           path: |
             test-reports/
             **/build/reports/tests/
-          retention-days: 7
+          retention-days: ${{ job.status == 'success' && github.repository != 'apache/pulsar' && 3 || 7 }}
           if-no-files-found: ignore
 
       - name: Upload possible heap dump, core dump or crash files
@@ -720,7 +980,7 @@ jobs:
     name: CI - System - ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    needs: ['preconditions', 'pulsar-test-latest-version-image']
+    needs: ['preconditions', 'pulsar-test-latest-version-image', 'integration-test-artifacts']
     if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
     env:
       JOB_NAME: CI - System - ${{ matrix.name }}
@@ -745,8 +1005,14 @@ jobs:
           - name: Pulsar Connectors - Thread
             group: PULSAR_CONNECTORS_THREAD
 
-          - name: Pulsar Connectors - Process
-            group: PULSAR_CONNECTORS_PROCESS
+          - name: Pulsar Connectors - Process Java
+            group: PULSAR_CONNECTORS_PROCESS_JAVA
+
+          - name: Pulsar Connectors - Process Python
+            group: PULSAR_CONNECTORS_PROCESS_PYTHON
+
+          - name: Pulsar Connectors - Process Go
+            group: PULSAR_CONNECTORS_PROCESS_GO
 
           - name: Plugin
             group: PLUGIN
@@ -779,10 +1045,10 @@ jobs:
       - name: Restore build outputs from build job
         uses: actions/download-artifact@v8
         with:
-          name: gradle-build-outputs
+          name: integration-test-build-outputs
 
       - name: Extract build outputs
-        run: tar xf gradle-build-outputs.tar
+        run: tar xf "integration-test-build-outputs.tar"
 
       - name: Download docker image
         uses: actions/download-artifact@v8
@@ -807,13 +1073,14 @@ jobs:
 
       - name: Upload test reports
         uses: actions/upload-artifact@v7
-        if: ${{ !success() }}
+        # Keep successful personal-CI reports to compare coverage and timings.
+        if: ${{ !success() || github.repository != 'apache/pulsar' }}
         with:
           name: System-${{ matrix.group }}-test-reports
           path: |
             test-reports/
             **/build/reports/tests/
-          retention-days: 7
+          retention-days: ${{ job.status == 'success' && github.repository != 'apache/pulsar' && 3 || 7 }}
           if-no-files-found: ignore
 
       - name: Upload possible heap dump, core dump or crash files
@@ -920,6 +1187,7 @@ jobs:
     timeout-minutes: 10
     needs: [
       'preconditions',
+      'publication-checks',
       'unit-tests',
       'integration-tests',
       'system-tests',
@@ -932,6 +1200,7 @@ jobs:
         run: |
           if [[ ! ( \
                    "${{ needs.preconditions.result }}" == "success" \
+                && "${{ needs.publication-checks.result }}" == "success" \
                 && "${{ needs.unit-tests.result }}" == "success" \
                 && "${{ needs.integration-tests.result }}" == "success" \
                 && "${{ needs.system-tests.result }}" == "success" \
@@ -948,5 +1217,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts \
-            --jq '.artifacts[] | select(.name == "gradle-build-outputs" or .name == "java-test-image" or .name == "pulsar-test-latest-version-image") | .id' \
+            --jq '.artifacts[] | select(.name == "broker-test-build-outputs" or .name == "integration-test-build-outputs" or .name == "unit-test-build-outputs" or .name == "gradle-build-outputs" or .name == "java-test-image" or .name == "pulsar-test-latest-version-image") | .id' \
             | xargs -I{} gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/{} || true

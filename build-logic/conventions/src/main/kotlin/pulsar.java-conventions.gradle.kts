@@ -222,6 +222,12 @@ tasks.withType<Test>().configureEach {
         val excludedTestGroups = providers.gradleProperty("excludedTestGroups").getOrElse("quarantine,flaky")
         excludeGroups(*(excludedTestGroups.split(",").map { it.trim() }.toTypedArray()))
     }
+    // Partition candidate class files, leaving the classpath and TestNG group/method selection intact.
+    // No class inventory is required: newly added classes automatically belong to exactly one shard.
+    providers.gradleProperty("testClassShard").orNull?.let { shard ->
+        inputs.property("testClassShard", shard)
+        exclude(TestClassShardFilter(shard))
+    }
     testLogging {
         events("FAILED")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
@@ -261,6 +267,25 @@ tasks.withType<Test>().configureEach {
         // loopback would otherwise fail to start.
         "-Djava.net.preferIPv4Stack=true",
     )
+}
+
+// Prepare every declared input of the module's standard Test task, including explicit NAR,
+// shaded JAR and generated-resource dependencies, without scheduling the Test task itself.
+// A plain provider resolves under this project's task-graph lock. Mapping the Test TaskProvider
+// would retain its implicit producer dependency and inadvertently execute the tests.
+val ciUnitTestTask = tasks.named<Test>("test")
+val ciUnitTestDependencies = providers.provider {
+    val test = ciUnitTestTask.get()
+    val dependencies = test.taskDependencies.getDependencies(test)
+    require(dependencies.none { it is Test }) {
+        "Cannot prepare ${test.path}: its declared dependencies include another Test task"
+    }
+    dependencies
+}
+tasks.register("prepareCiUnitTestArtifacts") {
+    group = "build"
+    description = "Build all standard Unit test inputs without running tests"
+    dependsOn(ciUnitTestDependencies)
 }
 
 // Expose test classes for cross-module test dependencies (Maven test-jar equivalent)
