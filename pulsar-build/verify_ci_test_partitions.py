@@ -29,6 +29,7 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -103,6 +104,8 @@ def verify_partition(label, suite, shards):
 
 
 def verify_dispatcher(suite, original_group, shards, selections):
+    original_groups = (original_group,) if isinstance(original_group, str) else tuple(original_group)
+    records = []
     # Execute the real dispatcher, including gradle_integration_test, in an isolated
     # checkout skeleton. No Docker, Gradle daemon, compilation or test execution.
     with tempfile.TemporaryDirectory(prefix="pulsar-ci-partitions-") as directory:
@@ -170,14 +173,92 @@ def verify_dispatcher(suite, original_group, shards, selections):
             return selected
 
         for event in ("pull_request", "workflow_dispatch"):
-            baseline = expand(run_group(original_group, event))
+            baseline_commands = {group: run_group(group, event) for group in original_groups}
+            baseline = Counter()
+            for commands in baseline_commands.values():
+                baseline.update(expand(commands))
+            candidate_commands = {group: run_group(group, event) for _, group in shards}
             candidate = Counter()
-            for _, group in shards:
-                candidate.update(expand(run_group(group, event)))
+            for commands in candidate_commands.values():
+                candidate.update(expand(commands))
             if candidate != baseline:
                 raise SystemExit(f"{suite} dispatcher mismatch ({event}): "
                                  f"missing={baseline - candidate}, extra={candidate - baseline}")
-    print(f"{original_group} dispatcher preserves classes, supplemental suites, groups and CI flags")
+            records.append({"event": event, "baseline": baseline_commands, "candidate": candidate_commands})
+    print(f"{' + '.join(original_groups)} dispatcher preserves classes, supplemental suites, groups and CI flags")
+    return records
+
+
+def verify_function_balance():
+    metadata_class = "org.apache.pulsar.tests.integration.functions.PulsarMetadataStateStoreTest"
+    balanced_suite = "pulsar-function-balanced.xml"
+    metadata_suite = "pulsar-function-metadata-state.xml"
+    selections = verify_partition("Function", "pulsar-function", (
+        ("balanced", "FUNCTION_BALANCED"),
+        ("metadata-state", "PULSAR_CONNECTORS_PROCESS_GO_BALANCED"),
+    ))
+    if selections[metadata_suite] != Counter({metadata_class: 1}):
+        raise SystemExit("Function balance must move the complete Metadata state class exactly once")
+
+    def ordered_classes(filename):
+        return [element.attrib["name"]
+                for element in ET.parse(RESOURCES / filename).getroot().find("test/classes")]
+
+    expected_order = [name for name in ordered_classes("pulsar-function.xml") if name != metadata_class]
+    if ordered_classes(balanced_suite) != expected_order:
+        raise SystemExit("Balanced Function must preserve the remaining classes in their original order")
+    selections["pulsar-process-go.xml"] = read_suite("pulsar-process-go.xml")[0]
+    records = verify_dispatcher("Function + Process Go", ("FUNCTION", "PULSAR_CONNECTORS_PROCESS_GO"), (
+        ("balanced", "FUNCTION_BALANCED"),
+        ("go-balanced", "PULSAR_CONNECTORS_PROCESS_GO_BALANCED"),
+    ), selections)
+
+    def with_suite(arguments, filename):
+        return [f"-PintegrationTestSuiteFile={filename}"
+                if argument.startswith("-PintegrationTestSuiteFile=") else argument
+                for argument in arguments]
+
+    for record in records:
+        function_calls = record["baseline"]["FUNCTION"]
+        if len(function_calls) != 1 or any(argument.startswith("-PtestGroups=")
+                                           for argument in function_calls[0]):
+            raise SystemExit("Original Function must remain one invocation without a group filter")
+        expected_function = [with_suite(function_calls[0], balanced_suite)]
+        expected_go = record["baseline"]["PULSAR_CONNECTORS_PROCESS_GO"] + [
+            with_suite(function_calls[0], metadata_suite)]
+        if record["candidate"]["FUNCTION_BALANCED"] != expected_function:
+            raise SystemExit("Balanced Function must retain the original unfiltered invocation and flags")
+        if record["candidate"]["PULSAR_CONNECTORS_PROCESS_GO_BALANCED"] != expected_go:
+            raise SystemExit("Balanced Go must run the unchanged Go calls before one unfiltered Metadata call")
+
+    # Validate the actual System matrix rather than only testing unused helper entrypoints.
+    workflow = (ROOT / ".github/workflows/pulsar-ci.yaml").read_text()
+    match = re.search(r"^  system-tests:\n(.*?)(?=^  [a-zA-Z0-9_-]+:|\Z)", workflow, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise SystemExit("Missing System test job")
+    system = match.group(1)
+    matrix = re.search(r"^      matrix:\n(.*?)(?=^    steps:)", system, re.MULTILINE | re.DOTALL)
+    if matrix is None:
+        raise SystemExit("Missing explicit System matrix")
+    groups = Counter()
+    for value in re.findall(r"^\s+group:\s*([^\n]+)$", matrix.group(1), re.MULTILINE):
+        literal = re.fullmatch(r'''(?:"([A-Z0-9_]+)"|'([A-Z0-9_]+)'|([A-Z0-9_]+))(?:\s+#.*)?''', value.strip())
+        if literal is None:
+            raise SystemExit(f"System matrix must use explicit dispatcher group names: {value}")
+        groups[next(group for group in literal.groups() if group is not None)] += 1
+    expected_groups = Counter((
+        "TIERED_FILESYSTEM", "TIERED_JCLOUD", "FUNCTION_BALANCED", "SCHEMA", "PLUGIN",
+        "PULSAR_CONNECTORS_THREAD_SHARD_1", "PULSAR_CONNECTORS_THREAD_SHARD_2",
+        "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_1", "PULSAR_CONNECTORS_PROCESS_JAVA_SHARD_2",
+        "PULSAR_CONNECTORS_PROCESS_PYTHON", "PULSAR_CONNECTORS_PROCESS_GO_BALANCED",
+    ))
+    if groups != expected_groups:
+        raise SystemExit("System matrix must preserve all eleven groups with only the two balanced replacements")
+    if len(re.findall(r"^ {10}\./pulsar-build/run_integration_group_gradle\.sh "
+                      r"\$\{\{ matrix\.group \}\}\s*$", system, re.MULTILINE)) != 1:
+        raise SystemExit("System job must dispatch its selected matrix group")
+    print("Function and Go balance preserves whole classes, unfiltered state tests and invocation ordering")
+    return records
 
 
 def main():
@@ -196,6 +277,7 @@ def main():
         ("shard-1", "PULSAR_CONNECTORS_THREAD_SHARD_1"),
         ("shard-2", "PULSAR_CONNECTORS_THREAD_SHARD_2"),
     ), selections)
+    verify_function_balance()
 
 
 if __name__ == "__main__":

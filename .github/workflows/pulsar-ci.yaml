@@ -997,7 +997,7 @@ jobs:
             group: TIERED_JCLOUD
 
           - name: Function
-            group: FUNCTION
+            group: FUNCTION_BALANCED
 
           - name: Schema
             group: SCHEMA
@@ -1017,8 +1017,8 @@ jobs:
           - name: Pulsar Connectors - Process Python
             group: PULSAR_CONNECTORS_PROCESS_PYTHON
 
-          - name: Pulsar Connectors - Process Go
-            group: PULSAR_CONNECTORS_PROCESS_GO
+          - name: Pulsar Connectors - Process Go + Metadata State
+            group: PULSAR_CONNECTORS_PROCESS_GO_BALANCED
 
           - name: Plugin
             group: PLUGIN

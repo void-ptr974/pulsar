@@ -134,6 +134,15 @@ method and parameter multiplicities. Supplemental source/sink suite selections e
 jobs. Method balancing reduces serial test work but adds another fixture and runner setup, so measure the
 complete CI gate and queue time rather than adding testcase durations as a predicted wall-time saving.
 
+Function and Process Go use balanced dispatchers without adding a runner. Function keeps its four remaining
+whole classes; the complete `PulsarMetadataStateStoreTest` class runs after the original Go invocation in a
+separate Gradle invocation. Both Function selections retain the original absence of a TestNG group filter,
+while Go keeps its `function` filter. The original `FUNCTION` and `PULSAR_CONNECTORS_PROCESS_GO` entrypoints
+and XML suites remain available for reproduction. The partition guard compares their combined successful-run
+selection with the two balanced entries, including forwarded flags and call ordering. Existing shell failure
+handling remains: a failed Go invocation prevents its metadata follow-up. Compare successful report
+multiplicities and complete CI time to assess this balancing change.
+
 The build output archives exclude `.gradle` directories. Gradle caches are managed separately by `setup-gradle`;
 a cold or incompatible cache can still cause compilation after an archive is restored. Compare actual compilation
 steps, artifact transfer time, queue time and accumulated runner minutes when assessing the benefit. CRC32 gives

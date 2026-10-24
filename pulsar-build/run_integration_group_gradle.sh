@@ -125,6 +125,11 @@ test_group_function() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-function.xml "$@"
 }
 
+test_group_function_balanced() {
+  # Preserve the original unfiltered Function selection for the remaining whole classes.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-function-balanced.xml "$@"
+}
+
 test_group_schema() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-schema.xml "$@"
 }
@@ -184,6 +189,13 @@ test_group_pulsar_connectors_process_python() {
 
 test_group_pulsar_connectors_process_go() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process-go.xml -PtestGroups=function "$@"
+}
+
+test_group_pulsar_connectors_process_go_balanced() {
+  test_group_pulsar_connectors_process_go "$@"
+  # This class came from FUNCTION, whose original invocation has no group filter.
+  # Use a separate Gradle invocation so the preceding Go filter cannot select its tests.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-function-metadata-state.xml "$@"
 }
 
 test_group_pulsar_io() {
