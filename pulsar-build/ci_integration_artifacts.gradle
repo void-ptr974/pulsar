@@ -1,0 +1,84 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+// This one-off CI manifest collector needs the realized task graph. Invoke it only with
+// --no-configuration-cache; the prepare task itself remains configuration-cache compatible.
+gradle.taskGraph.whenReady { graph ->
+    def preparePath = ":tests:integration:prepareCiTestArtifacts"
+    if (!graph.hasTask(preparePath)) {
+        return
+    }
+    def skipDockerBuild = gradle.rootProject.providers.gradleProperty("inttest.skipDockerBuild")
+            .map { it.isEmpty() || it.toBoolean() }.getOrElse(false)
+    if (!skipDockerBuild) {
+        throw new GradleException("Lean Integration artifacts require -Pinttest.skipDockerBuild; CI loads separate images")
+    }
+    def rootPath = gradle.rootProject.projectDir.toPath().toAbsolutePath().normalize()
+    def prepareTask = graph.allTasks.find { it.path == preparePath }
+    def requiredTasks = new LinkedHashSet()
+    def collectDependencies
+    collectDependencies = { task ->
+        graph.getDependencies(task).each { dependency ->
+            if (requiredTasks.add(dependency)) {
+                collectDependencies(dependency)
+            }
+        }
+    }
+    collectDependencies(prepareTask)
+    def outputPaths = new TreeSet<String>()
+    def producerTasks = []
+    graph.allTasks.findAll { requiredTasks.contains(it) }.each { task ->
+        if (task instanceof org.gradle.api.tasks.testing.Test) {
+            throw new GradleException("Integration artifact producer must not execute tests: ${task.path}")
+        }
+        producerTasks.add(task.path)
+        task.outputs.files.files.each { output ->
+            def path = output.toPath().toAbsolutePath().normalize()
+            if (!path.startsWith(rootPath)) {
+                throw new GradleException("Integration producer output leaves checkout: ${task.path}")
+            }
+            def relative = rootPath.relativize(path)
+            // User caches and source files are never part of the artifact.
+            if (!relative.iterator().any { it.toString() == "build" }
+                    || relative.iterator().any { it.toString() in [".gradle", ".git"] }) {
+                throw new GradleException("Unexpected integration producer output: ${relative}")
+            }
+            outputPaths.add(relative.toString())
+        }
+    }
+    def testSourceSet = gradle.rootProject.project(":tests:integration")
+            .extensions.getByName("sourceSets").getByName("test")
+    def runtimeOutputs = testSourceSet.runtimeClasspath.files.collect { it.toPath().toAbsolutePath().normalize() }
+            .findAll { it.startsWith(rootPath) }.collect { rootPath.relativize(it).toString() }.sort()
+    def requiredOutputs = runtimeOutputs.findAll { it.endsWith(".jar") }
+    requiredOutputs.addAll(testSourceSet.output.classesDirs.files.collect {
+        rootPath.relativize(it.toPath().toAbsolutePath().normalize()).toString()
+    })
+    requiredOutputs.add("tests/integration/build/resources/test/certificate-authority")
+    def manifest = rootPath.resolve("tests/integration/build/ci-test-artifacts.json").toFile()
+    manifest.parentFile.mkdirs()
+    manifest.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+        schemaVersion: 1,
+        prepareTask: preparePath,
+        producerTasks: producerTasks.sort(),
+        outputs: outputPaths.toList(),
+        runtimeOutputs: runtimeOutputs,
+        requiredOutputs: requiredOutputs.sort(),
+    ])) + "\n"
+}

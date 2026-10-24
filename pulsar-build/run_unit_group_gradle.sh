@@ -61,16 +61,43 @@ echo_and_restore_trace() {
 alias echo='{ [[ $- =~ .*x.* ]] && trace_enabled=1 || trace_enabled=0; set +x; } 2> /dev/null; echo_and_restore_trace'
 
 # Test Groups  -- start --
+# Retain the unsharded groups for local reproduction and same-revision CI baselines.
 function test_group_broker_group_1() {
-  gradle_test :pulsar-broker:test -PtestGroups='broker'
+  run_broker_group_1
+  run_broker_group_1_isolated
+}
+
+function run_broker_group_1() {
+  gradle_test :pulsar-broker:test -PtestGroups='broker' "$@"
+}
+
+function run_broker_group_1_isolated() {
   # run broker-isolated test individually
   gradle_test :pulsar-broker:test -PexcludedTestGroups='' \
     --tests 'org.apache.pulsar.broker.stats.prometheus.PrometheusMetricsGeneratorWithNoUnsafeTest'
 }
 
+function test_group_broker_group_1_shard_1() {
+  run_broker_group_1 -PtestClassShard=1/2
+  # Keep the original isolated invocation exactly once, outside the shard filter.
+  run_broker_group_1_isolated
+}
+
+function test_group_broker_group_1_shard_2() {
+  run_broker_group_1 -PtestClassShard=2/2
+}
+
 function test_group_broker_group_2() {
   gradle_test :pulsar-broker:test \
-    -PtestGroups='schema,utils,functions-worker,broker-io,broker-discovery,broker-compaction,broker-naming,websocket,other,builtin,stats'
+    -PtestGroups='schema,utils,functions-worker,broker-io,broker-discovery,broker-compaction,broker-naming,websocket,other,builtin,stats' "$@"
+}
+
+function test_group_broker_group_2_shard_1() {
+  test_group_broker_group_2 -PtestClassShard=1/2
+}
+
+function test_group_broker_group_2_shard_2() {
+  test_group_broker_group_2 -PtestClassShard=2/2
 }
 
 function test_group_broker_group_3() {
@@ -86,15 +113,39 @@ function test_group_broker_group_4() {
 }
 
 function test_group_broker_group_5() {
-  gradle_test :pulsar-broker:test -PtestGroups='broker-replication'
+  gradle_test :pulsar-broker:test -PtestGroups='broker-replication' "$@"
+}
+
+function test_group_broker_group_5_shard_1() {
+  test_group_broker_group_5 -PtestClassShard=1/2
+}
+
+function test_group_broker_group_5_shard_2() {
+  test_group_broker_group_5 -PtestClassShard=2/2
 }
 
 function test_group_broker_client_api() {
-  gradle_test :pulsar-broker:test -PtestGroups='broker-api'
+  gradle_test :pulsar-broker:test -PtestGroups='broker-api' "$@"
+}
+
+function test_group_broker_client_api_shard_1() {
+  test_group_broker_client_api -PtestClassShard=1/2
+}
+
+function test_group_broker_client_api_shard_2() {
+  test_group_broker_client_api -PtestClassShard=2/2
 }
 
 function test_group_broker_client_impl() {
-  gradle_test :pulsar-broker:test -PtestGroups='broker-impl'
+  gradle_test :pulsar-broker:test -PtestGroups='broker-impl' "$@"
+}
+
+function test_group_broker_client_impl_shard_1() {
+  test_group_broker_client_impl -PtestClassShard=1/2
+}
+
+function test_group_broker_client_impl_shard_2() {
+  test_group_broker_client_impl -PtestClassShard=2/2
 }
 
 function test_group_client() {

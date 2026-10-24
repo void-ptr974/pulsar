@@ -216,6 +216,14 @@ val integrationTest = tasks.register<Test>("integrationTest") {
     systemProperty("testFailFast", failFastValue.toString())
 }
 
+// CI passes -Pinttest.skipDockerBuild because the test jobs load images from the full build.
+// Follow integrationTest itself so any additional runner-side fixtures are prepared as well.
+tasks.register("prepareCiTestArtifacts") {
+    group = "build"
+    description = "Build integration-test runtime artifacts without running tests"
+    CiTestArtifactDependencies.configure(this, integrationTest)
+}
+
 // Profiling an integration test used to take a documented sequence of image builds, exported
 // environment variables and a privileged container run. `profilingIntegrationTest` below does all of
 // it, so profiling a cluster is one command. See CONTRIBUTING.md.

@@ -170,6 +170,13 @@ dependencies {
     testExamplesJar(project(":pulsar-functions:pulsar-functions-api-examples"))
 }
 
+// Follow the actual Test dependencies so newly declared fixtures are included automatically.
+tasks.register("prepareCiTestArtifacts") {
+    group = "build"
+    description = "Prepares all broker test inputs without executing tests."
+    CiTestArtifactDependencies.configure(this, tasks.named<Test>("test"))
+}
+
 tasks.withType<Test> {
     dependsOn(testNars, testExamplesJar)
     val narFiles = testNars.incoming.artifacts.resolvedArtifacts

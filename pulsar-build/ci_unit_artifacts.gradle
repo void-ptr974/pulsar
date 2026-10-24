@@ -1,0 +1,101 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+// This one-off manifest collector inspects the realized graph. Invoke it with
+// --no-configuration-cache; prepareCiUnitTestArtifacts itself supports configuration caching.
+gradle.taskGraph.whenReady { graph ->
+    def prepareTasks = graph.allTasks.findAll { it.name == "prepareCiUnitTestArtifacts" }
+    if (prepareTasks.isEmpty()) {
+        return
+    }
+    // These outputs are for the default protobuf dependency set only. Compatibility tests
+    // continue to prepare their own inputs with the original protobuf-version override.
+    if (gradle.rootProject.providers.gradleProperty("protobufVersion").isPresent()) {
+        throw new GradleException("Unit CI artifacts must not override protobufVersion")
+    }
+    def scheduledTests = graph.allTasks.findAll { it instanceof org.gradle.api.tasks.testing.Test }
+    if (!scheduledTests.isEmpty()) {
+        throw new GradleException("Unit artifact producer must not execute tests: ${scheduledTests*.path}")
+    }
+    def rootPath = gradle.rootProject.projectDir.toPath().toAbsolutePath().normalize()
+    def relativeOutput = { file ->
+        def path = file.toPath().toAbsolutePath().normalize()
+        if (!path.startsWith(rootPath)) {
+            throw new GradleException("Unit producer output leaves checkout: ${path}")
+        }
+        def relative = rootPath.relativize(path)
+        if (!relative.iterator().any { it.toString() == "build" }
+                || relative.iterator().any { it.toString() in [".gradle", ".git"] }) {
+            throw new GradleException("Unexpected Unit producer output: ${relative}")
+        }
+        relative.toString()
+    }
+    def requiredTasks = new LinkedHashSet()
+    def collectDependencies
+    collectDependencies = { task ->
+        // Read the populated graph instead of re-resolving task dependencies across project
+        // state locks. This also excludes unrelated tasks if assemble shares this invocation.
+        graph.getDependencies(task).each { dependency ->
+            if (requiredTasks.add(dependency)) {
+                collectDependencies(dependency)
+            }
+        }
+    }
+    prepareTasks.each { collectDependencies(it) }
+    def outputPaths = new TreeSet<String>()
+    def requiredOutputs = new TreeSet<String>()
+    requiredTasks.each { task ->
+        task.outputs.files.files.each { output -> outputPaths.add(relativeOutput(output)) }
+        if (task.enabled && task instanceof org.gradle.api.tasks.bundling.AbstractArchiveTask) {
+            requiredOutputs.add(relativeOutput(task.archiveFile.get().asFile))
+        }
+        if (task.enabled && task instanceof org.gradle.api.tasks.Copy
+                && (!(task instanceof org.gradle.language.jvm.tasks.ProcessResources) || !task.source.isEmpty())) {
+            requiredOutputs.add(relativeOutput(task.destinationDir))
+        }
+    }
+    def runtimeOutputs = new TreeSet<String>()
+    def testModules = prepareTasks.collect { prepare ->
+        def test = prepare.project.tasks.named("test").get()
+        def sourceSet = prepare.project.extensions.getByName("sourceSets").getByName("test")
+        def moduleRuntime = test.classpath.files.collect { it.toPath().toAbsolutePath().normalize() }
+                .findAll { it.startsWith(rootPath) }.collect { relativeOutput(it.toFile()) }.sort()
+        runtimeOutputs.addAll(moduleRuntime)
+        requiredOutputs.addAll(moduleRuntime.findAll { it.endsWith(".jar") || it.endsWith(".nar") })
+        // Empty/NO-SOURCE modules have no classes directory; modules with Java tests must have
+        // their complete class output. Resources and generated fixtures remain graph outputs.
+        if (!sourceSet.allJava.isEmpty()) {
+            requiredOutputs.addAll(sourceSet.output.classesDirs.files.collect { relativeOutput(it) })
+        }
+        [project: prepare.project.path, testTask: test.path, runtimeOutputs: moduleRuntime]
+    }.sort { it.project }
+    def manifest = rootPath.resolve("build/ci-unit-test-artifacts.json").toFile()
+    manifest.parentFile.mkdirs()
+    manifest.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+        schemaVersion: 1,
+        prepareTask: "prepareCiUnitTestArtifacts",
+        protobufOverride: false,
+        prepareTasks: prepareTasks*.path.sort(),
+        producerTasks: requiredTasks*.path.sort(),
+        testModules: testModules,
+        outputs: outputPaths.toList(),
+        runtimeOutputs: runtimeOutputs.toList(),
+        requiredOutputs: requiredOutputs.toList(),
+    ])) + "\n"
+}
