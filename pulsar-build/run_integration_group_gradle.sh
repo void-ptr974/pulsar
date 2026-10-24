@@ -63,8 +63,35 @@ test_group_cli() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-auth.xml "$@"
 }
 
+test_group_cli_admin() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-cli-admin.xml "$@"
+}
+
+test_group_cli_tools() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-cli-tools.xml "$@"
+  # Keep the original auth selection once across the two CLI jobs.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-auth.xml "$@"
+}
+
 test_group_messaging() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-messaging.xml "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-proxy.xml "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-websocket.xml "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-tls.xml "$@"
+}
+
+test_group_messaging_smoke() {
+  # Keep the whole class, including both Factory instances and all provider rows.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-messaging-smoke.xml "$@"
+}
+
+test_group_messaging_topic() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-messaging-topic.xml "$@"
+}
+
+test_group_messaging_other() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-messaging-other.xml "$@"
+  # Keep these supplemental selections once across the three Messaging jobs.
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-proxy.xml "$@"
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-websocket.xml "$@"
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-tls.xml "$@"
