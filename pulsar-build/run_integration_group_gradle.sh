@@ -128,6 +128,24 @@ test_group_pulsar_connectors_process() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=sink "$@"
 }
 
+test_group_pulsar_connectors_process_java() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=function \
+    --tests 'org.apache.pulsar.tests.integration.functions.java.*' "$@"
+  # Keep the unfiltered source and sink phases on one shard.
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=source "$@"
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=sink "$@"
+}
+
+test_group_pulsar_connectors_process_python() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=function \
+    --tests 'org.apache.pulsar.tests.integration.functions.python.*' "$@"
+}
+
+test_group_pulsar_connectors_process_go() {
+  gradle_integration_test -PintegrationTestSuiteFile=pulsar-process.xml -PtestGroups=function \
+    --tests 'org.apache.pulsar.tests.integration.functions.go.*' "$@"
+}
+
 test_group_pulsar_io() {
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-io-sources.xml -PtestGroups=source "$@"
   gradle_integration_test -PintegrationTestSuiteFile=pulsar-io-sinks.xml -PtestGroups=sink "$@"

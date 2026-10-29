@@ -198,6 +198,10 @@ val integrationTest = tasks.register<Test>("integrationTest") {
     }
 
     if (!ideaActive && (!hasCliTestsFilter || integrationTestSuiteFileExplicit)) {
+        if (hasCliTestsFilter) {
+            // Let TestNG discover suite tests inherited from abstract classes that Gradle's scanner skips.
+            isScanForTestClasses = false
+        }
         useTestNG {
             suites("src/test/resources/${integrationTestSuiteFile}")
             if (!integrationTestGroups.isNullOrEmpty()) {

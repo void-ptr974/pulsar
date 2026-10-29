@@ -801,8 +801,14 @@ jobs:
           - name: Pulsar Connectors - Thread
             group: PULSAR_CONNECTORS_THREAD
 
-          - name: Pulsar Connectors - Process
-            group: PULSAR_CONNECTORS_PROCESS
+          - name: Pulsar Connectors - Process - Java
+            group: PULSAR_CONNECTORS_PROCESS_JAVA
+
+          - name: Pulsar Connectors - Process - Python
+            group: PULSAR_CONNECTORS_PROCESS_PYTHON
+
+          - name: Pulsar Connectors - Process - Go
+            group: PULSAR_CONNECTORS_PROCESS_GO
 
           - name: Plugin
             group: PLUGIN
