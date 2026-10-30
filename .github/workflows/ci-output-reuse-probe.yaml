@@ -20,9 +20,6 @@
 name: CI output reuse probe
 
 on:
-  push:
-    branches:
-      - ci/shared-build-cache-20261030
   workflow_dispatch:
     inputs:
       source_run_id:

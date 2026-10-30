@@ -1,0 +1,190 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: CI unit Gradle-only validation
+
+on:
+  push:
+    branches:
+      - ci/shared-build-cache-20261030
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-unit-gradle-only-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JDK_DISTRIBUTION: corretto
+
+jobs:
+  unit-gradle-only:
+    name: CI - Unit - ${{ matrix.name }} - Gradle cache
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Other
+            group: OTHER
+            timeout: 75
+          - name: Brokers - Broker Group 1
+            group: BROKER_GROUP_1
+            timeout: 70
+          - name: Brokers - Broker Group 2
+            group: BROKER_GROUP_2
+            timeout: 60
+          - name: Brokers - Broker Group 4
+            group: BROKER_GROUP_4
+            timeout: 60
+          - name: Brokers - Broker Group 5
+            group: BROKER_GROUP_5
+            timeout: 60
+          - name: Brokers - Client Api
+            group: BROKER_CLIENT_API
+            timeout: 60
+          - name: Brokers - Client Impl
+            group: BROKER_CLIENT_IMPL
+            timeout: 60
+          - name: Proxy
+            group: PROXY
+            timeout: 60
+          - name: Pulsar IO
+            group: PULSAR_IO
+            timeout: 60
+          - name: Pulsar Client
+            group: CLIENT
+            timeout: 60
+          - name: Pulsar Metadata
+            group: METADATA
+            timeout: 60
+          - name: Protobuf v3
+            group: PROTOBUFV3
+            timeout: 60
+    env:
+      JOB_NAME: CI - Unit - ${{ matrix.name }} - Gradle cache
+      CI_JDK_MAJOR_VERSION: '25'
+      TRACE_TEST_RESOURCE_CLEANUP: 'off'
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: 10000
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: report
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    steps:
+      - name: Checkout probe
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Clean Disk for replication tests or resource tracing
+        if: ${{ matrix.group == 'BROKER_GROUP_5' || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
+        uses: ./.github/actions/clean-disk
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: '25'
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: true
+
+      - name: Use the normal Gradle task cache
+        run: |
+          task_cache="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/build-cache-1"
+          mkdir -p "$task_cache"
+          echo "PULSAR_CI_TASK_CACHE=$task_cache" >> "$GITHUB_ENV"
+
+      - name: Run unit test group '${{ matrix.group }}' with Gradle cache
+        env:
+          TEST_GROUP: ${{ matrix.group }}
+        run: |
+          mkdir -p build/ci-unit-gradle-only-validation
+          started=$SECONDS
+          set +e
+          ./pulsar-build/run_unit_group_gradle.sh "$TEST_GROUP" \
+            --init-script "$GITHUB_WORKSPACE/pulsar-build/ci-task-cache.init.gradle" \
+            --info --profile --console=plain 2>&1 | tee build/ci-unit-gradle-only-validation/unit-group.log
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          elapsed=$((SECONDS - started))
+          status=${pipeline_status[0]}
+          if [[ $status == 0 ]]; then
+            status=${pipeline_status[1]}
+          fi
+          printf '{"group":"%s","mode":"gradle-only","elapsed_seconds":%s,"exit_code":%s}\n' \
+            "$TEST_GROUP" "$elapsed" "$status" > build/ci-unit-gradle-only-validation/timing.json
+          exit "$status"
+
+      - name: Print JVM thread dumps when cancelled
+        if: ${{ cancelled() }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh print_thread_dumps
+
+      - name: Aggregate test reports
+        if: ${{ always() }}
+        uses: ./.github/actions/copy-test-reports
+
+      - name: Upload probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-unit-gradle-only-${{ matrix.group }}
+          path: |
+            build/ci-unit-gradle-only-validation/
+            **/build/reports/profile/
+            **/build/test-results/**/*.xml
+            test-reports/*.xml
+            test-results/**/*.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Report detected thread leaks
+        if: ${{ always() }}
+        run: |
+          if [ -d "$THREAD_LEAK_DETECTOR_DIR" ]; then
+            cat "$THREAD_LEAK_DETECTOR_DIR"/threadleak*.txt \
+              | awk '/^Summary:/ {print "::warning::" $0 "\n"; next} {print}'
+          fi
+
+      - name: Report detected Netty leaks
+        if: ${{ always() }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+
+      - name: Upload failure reports
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-unit-gradle-only-${{ matrix.group }}-failure-reports
+          path: |
+            test-reports/
+            **/build/reports/tests/
+            build/thread-leak-dumps/
+            build/netty-leak-dumps/
+          retention-days: 7
+          if-no-files-found: ignore
