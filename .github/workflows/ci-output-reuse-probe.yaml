@@ -1,0 +1,173 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: CI output reuse probe
+
+on:
+  push:
+    branches:
+      - ci/shared-build-cache-20261030
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Personal CI run with an uploaded shared build-output artifact'
+        required: true
+        type: string
+        default: '41077930801'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-output-reuse-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_RUN_ID: ${{ inputs.source_run_id || '41077930801' }}
+  JDK_DISTRIBUTION: corretto
+
+jobs:
+  output-reuse:
+    name: Output reuse - ${{ matrix.mode }}
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [outputs, gradle-only]
+    env:
+      JOB_NAME: Output reuse - ${{ matrix.mode }}
+      CI_JDK_MAJOR_VERSION: '25'
+      TRACE_TEST_RESOURCE_CLEANUP: 'off'
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: 10000
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: report
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    steps:
+      - name: Checkout probe
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: '25'
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: true
+
+      - name: Use the normal Gradle task cache
+        run: |
+          task_cache="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/build-cache-1"
+          mkdir -p "$task_cache"
+          echo "PULSAR_CI_TASK_CACHE=$task_cache" >> "$GITHUB_ENV"
+
+      - name: Restore build outputs from the full CI run
+        if: ${{ matrix.mode == 'outputs' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: gradle-build-outputs
+          repository: void-ptr974/pulsar
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Extract build outputs
+        if: ${{ matrix.mode == 'outputs' }}
+        run: |
+          tar xf gradle-build-outputs.tar
+          rm -f -- gradle-build-outputs.tar
+
+      - name: Run the complete BROKER_GROUP_3 test group
+        env:
+          PROBE_MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p build/ci-output-reuse-probe
+          started=$SECONDS
+          set +e
+          ./pulsar-build/run_unit_group_gradle.sh BROKER_GROUP_3 \
+            --init-script "$GITHUB_WORKSPACE/pulsar-build/ci-task-cache.init.gradle" \
+            --info --profile --console=plain 2>&1 | tee build/ci-output-reuse-probe/unit-group.log
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          elapsed=$((SECONDS - started))
+          status=${pipeline_status[0]}
+          if [[ $status == 0 ]]; then
+            status=${pipeline_status[1]}
+          fi
+          printf '{"mode":"%s","elapsed_seconds":%s,"exit_code":%s}\n' \
+            "$PROBE_MODE" "$elapsed" "$status" > build/ci-output-reuse-probe/timing.json
+          exit "$status"
+
+      - name: Print JVM thread dumps when cancelled
+        if: ${{ cancelled() }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh print_thread_dumps
+
+      - name: Aggregate test reports
+        if: ${{ always() }}
+        uses: ./.github/actions/copy-test-reports
+
+      - name: Upload probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-output-reuse-${{ matrix.mode }}
+          path: |
+            build/ci-output-reuse-probe/
+            **/build/reports/profile/
+            **/build/test-results/**/*.xml
+            test-reports/*.xml
+            test-results/**/*.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Report detected thread leaks
+        if: ${{ always() }}
+        run: |
+          if [ -d "$THREAD_LEAK_DETECTOR_DIR" ]; then
+            cat "$THREAD_LEAK_DETECTOR_DIR"/threadleak*.txt \
+              | awk '/^Summary:/ {print "::warning::" $0 "\n"; next} {print}'
+          fi
+
+      - name: Report detected Netty leaks
+        if: ${{ always() }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+
+      - name: Upload failure reports
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-output-reuse-${{ matrix.mode }}-failure-reports
+          path: |
+            test-reports/
+            **/build/reports/tests/
+            build/thread-leak-dumps/
+            build/netty-leak-dumps/
+          retention-days: 7
+          if-no-files-found: ignore
