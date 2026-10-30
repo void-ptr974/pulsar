@@ -516,6 +516,8 @@ jobs:
             build/ci-cost-probe/
             **/build/reports/profile/
             **/build/test-results/**/*.xml
+            test-reports/*.xml
+            test-results/**/*.xml
           retention-days: 7
           if-no-files-found: warn
 
@@ -674,6 +676,8 @@ jobs:
             build/ci-cost-probe/
             **/build/reports/profile/
             **/build/test-results/**/*.xml
+            test-reports/*.xml
+            test-results/**/*.xml
           retention-days: 7
           if-no-files-found: warn
 
