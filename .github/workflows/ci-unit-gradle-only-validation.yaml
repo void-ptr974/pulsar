@@ -20,9 +20,6 @@
 name: CI unit Gradle-only validation
 
 on:
-  push:
-    branches:
-      - ci/shared-build-cache-20261030
   workflow_dispatch:
 
 permissions:
