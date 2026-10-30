@@ -1,0 +1,49 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import org.gradle.api.tasks.testing.Test
+
+// Explicitly selected CI jobs exchange this directory as a same-run artifact.
+// An absent variable leaves the ordinary Gradle cache configuration unchanged.
+def taskCachePath = System.getenv('PULSAR_CI_TASK_CACHE')
+if (taskCachePath) {
+    def taskCacheDirectory = new File(taskCachePath)
+    if (!taskCacheDirectory.isAbsolute()) {
+        throw new GradleException('PULSAR_CI_TASK_CACHE must be an absolute path')
+    }
+
+    // Init scripts also run for included builds, including build-logic.
+    settingsEvaluated { settings ->
+        settings.buildCache { cache ->
+            cache.local {
+                directory = taskCacheDirectory
+                enabled = true
+            }
+            if (cache.remote != null) {
+                cache.remote.enabled = false
+            }
+        }
+    }
+
+    allprojects { project ->
+        project.tasks.withType(Test).configureEach {
+            outputs.doNotCacheIf('CI shares build preparation, never test results') { true }
+        }
+    }
+}

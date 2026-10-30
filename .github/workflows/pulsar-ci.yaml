@@ -32,6 +32,11 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
+      ci_cost_probe:
+        description: 'Collect a same-run task-cache comparison in the personal fork'
+        required: false
+        type: boolean
+        default: false
       jdk_major_version:
         description: 'JDK major version to use for the build'
         required: true
@@ -158,6 +163,7 @@ jobs:
     name: Build and License check
     env:
       JOB_NAME: Build and License check
+      CI_COST_PROBE: ${{ github.repository == 'void-ptr974/pulsar' && github.event_name == 'workflow_dispatch' && inputs.ci_cost_probe }}
       CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -191,25 +197,67 @@ jobs:
           develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
           cache-read-only: false
 
+      - name: Use the normal Gradle task cache for comparison
+        if: ${{ env.CI_COST_PROBE == 'true' }}
+        run: |
+          task_cache="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/build-cache-1"
+          mkdir -p "$task_cache"
+          echo "PULSAR_CI_TASK_CACHE=$task_cache" >> "$GITHUB_ENV"
+
       - name: Build, check licenses and code style
-        run: >-
-          ./gradlew assemble rat spotlessCheck checkstyleMain checkstyleTest
-          --no-configuration-cache
+        run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            set -o pipefail
+            mkdir -p build/ci-cost-probe
+            ./gradlew --init-script pulsar-build/ci-task-cache.init.gradle assemble rat spotlessCheck checkstyleMain checkstyleTest --no-configuration-cache \
+              --info --console=plain 2>&1 | tee build/ci-cost-probe/producer-build.log
+          else
+            ./gradlew assemble rat spotlessCheck checkstyleMain checkstyleTest --no-configuration-cache
+          fi
 
       - name: Verify client and Functions API Java compatibility
-        run: ./gradlew :tests:pulsar-client-java-compatibility:test -PtestRetryCount=0
+        run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            set -o pipefail
+            mkdir -p build/ci-cost-probe
+            ./gradlew --init-script pulsar-build/ci-task-cache.init.gradle :tests:pulsar-client-java-compatibility:test -PtestRetryCount=0 \
+              --info --console=plain 2>&1 | tee build/ci-cost-probe/producer-compatibility.log
+          else
+            ./gradlew :tests:pulsar-client-java-compatibility:test -PtestRetryCount=0
+          fi
 
       - name: Check binary licenses
-        run: ./gradlew checkBinaryLicense --no-configuration-cache
+        run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            set -o pipefail
+            mkdir -p build/ci-cost-probe
+            ./gradlew --init-script pulsar-build/ci-task-cache.init.gradle checkBinaryLicense --no-configuration-cache \
+              --info --console=plain 2>&1 | tee build/ci-cost-probe/producer-binary-licenses.log
+          else
+            ./gradlew checkBinaryLicense --no-configuration-cache
+          fi
 
       - name: Check that project's public libraries can be published to a Maven repository
-        run: ./gradlew publishAllPublicationsToLocalDeployRepository
+        run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            set -o pipefail
+            mkdir -p build/ci-cost-probe
+            ./gradlew --init-script pulsar-build/ci-task-cache.init.gradle publishAllPublicationsToLocalDeployRepository \
+              --info --console=plain 2>&1 | tee build/ci-cost-probe/producer-publications.log
+          else
+            ./gradlew publishAllPublicationsToLocalDeployRepository
+          fi
 
       - name: Check API/SPI publication dependency closure with a custom group
-        # Validate generated POMs and Gradle metadata, including the BOM, without uploading artifacts.
-        run: >-
-          ./gradlew validateApiSpiPublication
-          -PpublishApiAndSpiOnly=true -Pgroup=myorg.pulsar
+        run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            set -o pipefail
+            mkdir -p build/ci-cost-probe
+            ./gradlew --init-script pulsar-build/ci-task-cache.init.gradle validateApiSpiPublication -PpublishApiAndSpiOnly=true -Pgroup=myorg.pulsar \
+              --info --console=plain 2>&1 | tee build/ci-cost-probe/producer-api-spi-publication.log
+          else
+            ./gradlew validateApiSpiPublication -PpublishApiAndSpiOnly=true -Pgroup=myorg.pulsar
+          fi
 
       - name: Upload Gradle reports
         uses: actions/upload-artifact@v4
@@ -221,13 +269,78 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Upload producer Gradle logs
+        if: ${{ always() && env.CI_COST_PROBE == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-cost-producer-gradle-logs
+          path: build/ci-cost-probe/producer-*.log
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Save build outputs for test jobs
         run: |
-          # Tar up compiled classes, resources, and distribution archives so test jobs
-          # don't need to recompile. Distribution tarballs are needed for Docker image builds.
-          find . \( -path '*/build/classes/*' -o -path '*/build/generated/*' -o -path '*/build/resources/*' \
+          # Share compiled outputs and distribution archives with downstream test
+          # and Docker image jobs. Distribution tarballs are needed for Docker image builds.
+          # Performance application TAR/ZIP bundles are not inputs of these jobs.
+          # Their compiled classes, resources, and libraries are still included.
+          find . -path './tests/performance/*/build/distributions' -prune -o \
+            \( -path '*/build/classes/*' -o -path '*/build/generated/*' -o -path '*/build/resources/*' \
             -o -path '*/build/libs/*' -o -path '*/build/tmp/jar/*' -o -path '*/build/distributions/*' \) -print \
             | tar cf /tmp/gradle-build-outputs.tar --files-from=-
+
+      - name: Measure original and trimmed build-output archives
+        if: ${{ env.CI_COST_PROBE == 'true' }}
+        run: |
+          # The second archive is diagnostic overhead and is never sent to consumers.
+          find . \( -path '*/build/classes/*' -o -path '*/build/generated/*' -o -path '*/build/resources/*' \
+            -o -path '*/build/libs/*' -o -path '*/build/tmp/jar/*' -o -path '*/build/distributions/*' \) -print \
+            | tar cf "$RUNNER_TEMP/original-gradle-build-outputs.tar" --files-from=-
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import time
+          import zlib
+
+          def compressed_body_bytes(path):
+              started = time.monotonic()
+              compressor = zlib.compressobj(level=1, wbits=-15)
+              size = 0
+              with path.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      size += len(compressor.compress(chunk))
+              size += len(compressor.flush())
+              return {"bytes": size, "measurement_seconds": time.monotonic() - started}
+
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          original = temporary / "original-gradle-build-outputs.tar"
+          trimmed = Path("/tmp/gradle-build-outputs.tar")
+          removed = sorted(Path("tests/performance").glob("*/build/distributions/*"))
+          report = {
+              "scope": "Same-build TAR sizes and ZIP level-1 deflate-body estimates; use Actions artifact size for actual transfer bytes",
+              "original_tar_bytes": original.stat().st_size,
+              "trimmed_tar_bytes": trimmed.stat().st_size,
+              "original_deflate_body": compressed_body_bytes(original),
+              "trimmed_deflate_body": compressed_body_bytes(trimmed),
+              "removed_distribution_files": [
+                  {"path": str(path), "bytes": path.stat().st_size}
+                  for path in removed if path.is_file()
+              ],
+          }
+          (temporary / "ci-cost-producer.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, indent=2))
+          original.unlink()
+          PYTHON
+
+      - name: Upload producer comparison evidence
+        if: ${{ env.CI_COST_PROBE == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-cost-producer-evidence
+          path: ${{ runner.temp }}/ci-cost-producer.json
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Upload build outputs
         uses: actions/upload-artifact@v7
@@ -236,6 +349,27 @@ jobs:
           path: /tmp/gradle-build-outputs.tar
           retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
           compression-level: 1
+
+      - name: Package build task cache
+        if: ${{ env.CI_COST_PROBE == 'true' }}
+        run: |
+          set -o pipefail
+          ./gradlew --stop
+          python3 pulsar-build/export-ci-task-cache.py "$RUNNER_TEMP/gradle-task-cache.tar" \
+            build/ci-cost-probe/producer-*.log \
+            | tee "$RUNNER_TEMP/ci-task-cache-export.json"
+
+      - name: Upload build task cache
+        if: ${{ env.CI_COST_PROBE == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gradle-task-cache
+          path: |
+            ${{ runner.temp }}/gradle-task-cache.tar
+            ${{ runner.temp }}/ci-task-cache-export.json
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: 1
+          if-no-files-found: error
 
       - name: Wait for ssh connection when build fails
         # ssh access is enabled for builds in own forks
@@ -250,6 +384,7 @@ jobs:
     name: CI - Unit - ${{ matrix.name }}
     env:
       JOB_NAME: CI - Unit - ${{ matrix.name }}
+      CI_COST_PROBE: ${{ github.repository == 'void-ptr974/pulsar' && github.event_name == 'workflow_dispatch' && inputs.ci_cost_probe && matrix.group == 'BROKER_GROUP_3' }}
       CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
       TRACE_TEST_RESOURCE_CLEANUP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trace_test_resource_cleanup || 'off' }}
       TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
@@ -325,6 +460,13 @@ jobs:
         with:
           develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
 
+      - name: Use the normal Gradle task cache for comparison
+        if: ${{ env.CI_COST_PROBE == 'true' }}
+        run: |
+          task_cache="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/build-cache-1"
+          mkdir -p "$task_cache"
+          echo "PULSAR_CI_TASK_CACHE=$task_cache" >> "$GITHUB_ENV"
+
       - name: Restore build outputs from build job
         uses: actions/download-artifact@v8
         with:
@@ -342,6 +484,19 @@ jobs:
 
       - name: Run unit test group '${{ matrix.group }}'
         run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            mkdir -p build/ci-cost-probe
+            set +e
+            ./pulsar-build/run_unit_group_gradle.sh ${{ matrix.group }} \
+              --init-script "$GITHUB_WORKSPACE/pulsar-build/ci-task-cache.init.gradle" \
+              --info --profile 2>&1 | tee build/ci-cost-probe/unit-group.log
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            if [[ ${pipeline_status[0]} != 0 ]]; then
+              exit "${pipeline_status[0]}"
+            fi
+            exit "${pipeline_status[1]}"
+          fi
           ./pulsar-build/run_unit_group_gradle.sh ${{ matrix.group }}
 
       - name: print JVM thread dumps when cancelled
@@ -351,6 +506,18 @@ jobs:
       - name: Aggregate test reports to ./test-reports directory
         if: ${{ always() }}
         uses: ./.github/actions/copy-test-reports
+
+      - name: Upload task-cache comparison evidence
+        if: ${{ always() && env.CI_COST_PROBE == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-cost-probe-${{ matrix.group }}-baseline
+          path: |
+            build/ci-cost-probe/
+            **/build/reports/profile/
+            **/build/test-results/**/*.xml
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Report detected thread leaks
         if: ${{ always() }}
@@ -380,6 +547,164 @@ jobs:
         if: ${{ always() }}
         with:
           name: Unit-${{ matrix.group }}-dumps
+          path: |
+            /tmp/*.hprof
+            **/hs_err_*.log
+            **/core.*
+            build/threaddumps/
+            ${{ env.NETTY_LEAK_DUMP_DIR }}/*
+            ${{ env.TRACE_TEST_RESOURCE_CLEANUP_DIR }}/*
+            ${{ env.THREAD_LEAK_DETECTOR_DIR }}/*
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Wait for ssh connection when build fails
+        # ssh access is enabled for builds in own forks
+        uses: ./.github/actions/ssh-access
+        if: ${{ failure() && github.repository != 'apache/pulsar' && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          action: wait
+
+  unit-test-cache-probe:
+    name: CI - Unit - Brokers - Broker Group 3 - task cache
+    env:
+      JOB_NAME: CI - Unit - Brokers - Broker Group 3 - task cache
+      CI_COST_PROBE: 'true'
+      CI_JDK_MAJOR_VERSION: ${{ needs.preconditions.outputs.jdk_major_version }}
+      TRACE_TEST_RESOURCE_CLEANUP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trace_test_resource_cleanup || 'off' }}
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.thread_leak_detector_wait_millis || 10000 }}
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: "${{ needs.preconditions.outputs.netty_leak_detection }}"
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    needs: ['preconditions', 'build-and-license-check']
+    if: ${{ github.repository == 'void-ptr974/pulsar' && github.event_name == 'workflow_dispatch' && inputs.ci_cost_probe && needs.preconditions.outputs.docs_only != 'true' }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Clean Disk for resource tracing
+        if: ${{ env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
+        uses: ./.github/actions/clean-disk
+
+      - name: Setup ssh access to build runner VM
+        # ssh access is enabled for builds in own forks
+        if: ${{ github.repository != 'apache/pulsar' && github.event_name == 'pull_request' }}
+        uses: ./.github/actions/ssh-access
+        continue-on-error: true
+        with:
+          limit-access-to-actor: true
+
+      - name: Set up JDK ${{ env.CI_JDK_MAJOR_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+      - name: Use the normal Gradle task cache for comparison
+        run: |
+          task_cache="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/build-cache-1"
+          mkdir -p "$task_cache"
+          echo "PULSAR_CI_TASK_CACHE=$task_cache" >> "$GITHUB_ENV"
+
+      - name: Download build task cache from this workflow run
+        uses: actions/download-artifact@v8
+        with:
+          name: gradle-task-cache
+          path: ${{ runner.temp }}/task-cache-artifact
+
+      - name: Restore build task cache
+        run: |
+          tar xf "$RUNNER_TEMP/task-cache-artifact/gradle-task-cache.tar" \
+            -C "$PULSAR_CI_TASK_CACHE"
+          rm -f -- "$RUNNER_TEMP/task-cache-artifact/gradle-task-cache.tar"
+
+      - name: Restore build outputs from build job
+        uses: actions/download-artifact@v8
+        with:
+          name: gradle-build-outputs
+
+      - name: Extract build outputs
+        run: |
+          tar xf gradle-build-outputs.tar
+          rm -f -- gradle-build-outputs.tar
+
+      - name: Run unit test group 'BROKER_GROUP_3'
+        run: |
+          if [[ "$CI_COST_PROBE" == 'true' ]]; then
+            mkdir -p build/ci-cost-probe
+            set +e
+            ./pulsar-build/run_unit_group_gradle.sh BROKER_GROUP_3 \
+              --init-script "$GITHUB_WORKSPACE/pulsar-build/ci-task-cache.init.gradle" \
+              --info --profile 2>&1 | tee build/ci-cost-probe/unit-group.log
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            if [[ ${pipeline_status[0]} != 0 ]]; then
+              exit "${pipeline_status[0]}"
+            fi
+            exit "${pipeline_status[1]}"
+          fi
+          ./pulsar-build/run_unit_group_gradle.sh BROKER_GROUP_3
+
+      - name: print JVM thread dumps when cancelled
+        if: cancelled()
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh print_thread_dumps
+
+      - name: Aggregate test reports to ./test-reports directory
+        if: ${{ always() }}
+        uses: ./.github/actions/copy-test-reports
+
+      - name: Upload task-cache comparison evidence
+        if: ${{ always() && env.CI_COST_PROBE == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-cost-probe-BROKER_GROUP_3-cache
+          path: |
+            build/ci-cost-probe/
+            **/build/reports/profile/
+            **/build/test-results/**/*.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Report detected thread leaks
+        if: ${{ always() }}
+        run: |
+          if [ -d "$THREAD_LEAK_DETECTOR_DIR" ]; then
+            cd "$THREAD_LEAK_DETECTOR_DIR"
+            cat threadleak*.txt | awk '/^Summary:/ {print "::warning::" $0 "\n"; next} {print}'
+          fi
+
+      - name: Report detected Netty leaks
+        if: ${{ always() && env.NETTY_LEAK_DETECTION != 'off' }}
+        run: $GITHUB_WORKSPACE/pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v7
+        if: ${{ !success() || env.TRACE_TEST_RESOURCE_CLEANUP != 'off' }}
+        with:
+          name: Unit-BROKER_GROUP_3-cache-probe-test-reports
+          path: |
+            test-reports/
+            **/build/reports/tests/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload possible heap dump, core dump or crash files
+        uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: Unit-BROKER_GROUP_3-cache-probe-dumps
           path: |
             /tmp/*.hprof
             **/hs_err_*.log
@@ -1007,6 +1332,7 @@ jobs:
     needs: [
       'preconditions',
       'unit-tests',
+      'unit-test-cache-probe',
       'integration-tests',
       'system-tests',
       'macos-build',
@@ -1019,6 +1345,7 @@ jobs:
           if [[ ! ( \
                    "${{ needs.preconditions.result }}" == "success" \
                 && "${{ needs.unit-tests.result }}" == "success" \
+                && ( "${{ needs.unit-test-cache-probe.result }}" == "success" || "${{ needs.unit-test-cache-probe.result }}" == "skipped" ) \
                 && "${{ needs.integration-tests.result }}" == "success" \
                 && "${{ needs.system-tests.result }}" == "success" \
                 && "${{ needs.macos-build.result }}" == "success" \
@@ -1029,7 +1356,7 @@ jobs:
           fi
 
       - name: Delete build artifacts
-        if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+        if: ${{ needs.preconditions.outputs.docs_only != 'true' && !(github.repository == 'void-ptr974/pulsar' && github.event_name == 'workflow_dispatch' && inputs.ci_cost_probe) }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
