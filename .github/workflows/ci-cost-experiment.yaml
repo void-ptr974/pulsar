@@ -1,0 +1,493 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: CI cost experiment
+
+on:
+  push:
+    branches:
+      - ci/artifact-cost-experiment-20261030
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: 'Run transport, output reuse, or both independent experiments'
+        type: choice
+        options:
+          - both
+          - transport
+          - reuse
+        default: both
+      source_run_id:
+        description: 'Existing run in this fork containing gradle-build-outputs'
+        type: string
+        default: '40901810757'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-cost-${{ github.ref }}-${{ inputs.experiment || 'both' }}
+  cancel-in-progress: true
+
+# Fork-only and bounded: 20 + (6 * 10) + 20 + (3 * 15) = 145 Runner-minutes
+# maximum, excluding runner startup/post-job overhead. No full test groups run.
+jobs:
+  transport-producer:
+    if: ${{ github.repository == 'void-ptr974/pulsar' && (github.event_name == 'push' || inputs.experiment == 'both' || inputs.experiment == 'transport') }}
+    name: Transport - prepare identical source payloads
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_RUN_ID: ${{ inputs.source_run_id || '40901810757' }}
+    steps:
+      - name: Checkout experiment
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download existing build outputs from this fork
+        uses: actions/download-artifact@v8
+        with:
+          name: gradle-build-outputs
+          path: ${{ runner.temp }}/transport-source
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: void-ptr974/pulsar
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Inventory source outputs and prepare transport variants
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/transport-unpacked" "$RUNNER_TEMP/transport-packed"
+          tar -xf "$RUNNER_TEMP/transport-source/gradle-build-outputs.tar" \
+            -C "$RUNNER_TEMP/transport-unpacked"
+          python3 pulsar-build/ci-cost-experiment/artifacts.py pack \
+            --workspace "$RUNNER_TEMP/transport-unpacked" \
+            --output-dir "$RUNNER_TEMP/transport-packed"
+          # Keep the downloaded original tar as the baseline. Repacking must not
+          # silently improve the control arm. Only core uses the repacked tar.
+          rm "$RUNNER_TEMP/transport-packed/baseline.tar"
+          # Release the extracted copy before creating compressed variants.
+          rm -rf "$RUNNER_TEMP/transport-unpacked"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import time
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          packed = temp / 'transport-packed'
+          original = temp / 'transport-source/gradle-build-outputs.tar'
+          result = {'source_run_id': os.environ['SOURCE_RUN_ID'],
+                    'experiment_sha': os.environ['GITHUB_SHA'],
+                    'compression_scope': 'Local precompression only; baseline ZIP cost is in its upload action',
+                    'variants': {}}
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                      value.update(chunk)
+              return value.hexdigest()
+          result['variants']['baseline'] = {
+              'file': original.name, 'size_bytes': original.stat().st_size,
+              'sha256': digest(original), 'compression_seconds': 0,
+              'description': 'Original source-run tar, zipped by upload-artifact at level 1'}
+          for mode, source in [('full', original), ('core', packed / 'core.tar')]:
+              destination = packed / (mode + '.tar.zst')
+              started = time.monotonic()
+              subprocess.run(['zstd', '-T2', '-3', '-f', str(source), '-o', str(destination)], check=True)
+              compression_seconds = time.monotonic() - started
+              result['variants'][mode] = {
+                  'file': destination.name, 'size_bytes': destination.stat().st_size,
+                  'sha256': digest(destination),
+                  'compression_seconds': compression_seconds}
+          (packed / 'transport-metrics.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              summary.write('### Transport payloads\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
+
+      - name: Upload original baseline with current archive behavior
+        uses: actions/upload-artifact@v7
+        with:
+          name: transport-baseline
+          path: ${{ runner.temp }}/transport-source/gradle-build-outputs.tar
+          compression-level: 1
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload full tar directly with zstd compression
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/transport-packed/full.tar.zst
+          archive: false
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload core tar directly with zstd compression
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/transport-packed/core.tar.zst
+          archive: false
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload manifest and producer measurements
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: transport-manifest
+          path: |
+            ${{ runner.temp }}/transport-packed/manifest.json
+            ${{ runner.temp }}/transport-packed/transport-metrics.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  transport-consumer:
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    needs: transport-producer
+    name: Transport - ${{ matrix.mode }} - repetition ${{ matrix.repetition }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, full, core]
+        repetition: [1, 2]
+    env:
+      TRANSPORT_MODE: ${{ matrix.mode }}
+      REPETITION: ${{ matrix.repetition }}
+    steps:
+      - name: Checkout verification code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Start measured download phase
+        run: |
+          mkdir -p "$RUNNER_TEMP/transport-results"
+          python3 -c 'import time; print(time.time())' > "$RUNNER_TEMP/transport-results/download-start"
+
+      - name: Download measured payload
+        id: payload
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.mode == 'baseline' && 'transport-baseline' || format('{0}.tar.zst', matrix.mode) }}
+          path: ${{ runner.temp }}/transport-download
+          skip-decompress: ${{ matrix.mode != 'baseline' }}
+
+      - name: Finish measured download phase
+        run: python3 -c 'import time; print(time.time())' > "$RUNNER_TEMP/transport-results/download-end"
+
+      - name: Download reference manifest
+        uses: actions/download-artifact@v8
+        with:
+          name: transport-manifest
+          path: ${{ runner.temp }}/transport-reference
+
+      - name: Extract payload and verify identical expected outputs
+        id: verify
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import stat
+          import subprocess
+          import sys
+          import time
+
+          sys.path.insert(0, 'pulsar-build/ci-cost-experiment')
+          import artifacts
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          results = temp / 'transport-results'
+          mode = os.environ['TRANSPORT_MODE']
+          reference = temp / 'transport-reference'
+          manifest = json.loads((reference / 'manifest.json').read_text())
+          metrics = json.loads((reference / 'transport-metrics.json').read_text())
+          archive_info = metrics['variants'][mode]
+          archive = temp / 'transport-download' / archive_info['file']
+          report = {'mode': mode, 'repetition': int(os.environ['REPETITION']),
+                    'experiment_sha': os.environ['GITHUB_SHA'],
+                    'source_run_id': metrics['source_run_id'],
+                    'download_phase_seconds': float((results / 'download-end').read_text())
+                                              - float((results / 'download-start').read_text()),
+                    'download_phase_includes_step_boundaries': True,
+                    'downloaded_file_bytes': archive.stat().st_size,
+                    'size_note': 'Baseline is an unzipped tar; use Actions artifact size for transfer comparisons',
+                    'core_scope_note': 'Core removes distributions and repacks entries; compare manifests and producer sizes',
+                    'expected_payload_sha256': archive_info['sha256']}
+          started = time.monotonic()
+          report['payload_sha256'] = artifacts.sha256(archive)
+          report['payload_verification_seconds'] = time.monotonic() - started
+          if report['payload_sha256'] != archive_info['sha256']:
+              raise SystemExit('Downloaded payload hash differs from producer')
+          target = temp / 'transport-extracted'
+          target.mkdir()
+          started = time.monotonic()
+          if mode == 'baseline':
+              subprocess.run(['tar', '-xf', str(archive), '-C', str(target)], check=True)
+          else:
+              subprocess.run(['tar', '--zstd', '-xf', str(archive), '-C', str(target)], check=True)
+          report['extract_seconds'] = time.monotonic() - started
+          started = time.monotonic()
+          verified = {'file': 0, 'directory': 0, 'symlink': 0}
+          for entry in manifest['outputs']:
+              relative = PurePosixPath(entry['path'])
+              if relative.is_absolute() or '..' in relative.parts:
+                  raise SystemExit('Invalid manifest path')
+              if mode == 'core' and artifacts.is_distribution(relative):
+                  if (target / relative).exists():
+                      raise SystemExit('Core unexpectedly contains a distribution output')
+                  continue
+              path = target / relative
+              attributes = path.lstat()
+              kind = entry['kind']
+              if kind == 'file':
+                  if not stat.S_ISREG(attributes.st_mode) or artifacts.sha256(path) != entry['sha256']:
+                      raise SystemExit('File hash/type mismatch: ' + str(relative))
+              elif kind == 'directory':
+                  if not stat.S_ISDIR(attributes.st_mode):
+                      raise SystemExit('Directory type mismatch: ' + str(relative))
+              elif kind == 'symlink':
+                  if not stat.S_ISLNK(attributes.st_mode) or os.readlink(path) != entry['target']:
+                      raise SystemExit('Symbolic link mismatch: ' + str(relative))
+              else:
+                  raise SystemExit('Unknown manifest entry kind')
+              if stat.S_IMODE(attributes.st_mode) != entry['mode']:
+                  raise SystemExit('File mode mismatch: ' + str(relative))
+              verified[kind] += 1
+          report.update(verification_seconds=time.monotonic() - started,
+                        verified_entries=verified, verification='passed')
+          (results / 'transport-result.json').write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              summary.write('### Transport result\n\n```json\n' + json.dumps(report, indent=2) + '\n```\n')
+          PY
+
+      - name: Record transport step outcomes
+        if: ${{ always() }}
+        env:
+          PAYLOAD_OUTCOME: ${{ steps.payload.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/transport-results"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          result = {name.lower(): os.environ[name] for name in (
+              'TRANSPORT_MODE', 'REPETITION', 'PAYLOAD_OUTCOME', 'VERIFY_OUTCOME')}
+          destination = Path(os.environ['RUNNER_TEMP']) / 'transport-results/step-outcomes.json'
+          destination.write_text(json.dumps(result, indent=2) + '\n')
+          PY
+
+      - name: Upload transport consumer measurements
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: transport-results-${{ matrix.mode }}-${{ matrix.repetition }}
+          path: ${{ runner.temp }}/transport-results
+          retention-days: 3
+          if-no-files-found: warn
+
+  reuse-producer:
+    if: ${{ github.repository == 'void-ptr974/pulsar' && (github.event_name == 'push' || inputs.experiment == 'both' || inputs.experiment == 'reuse') }}
+    name: Output reuse - compile producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout experiment
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK 17 and 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: corretto
+          java-version: |
+            17
+            25
+
+      - name: Setup Gradle with read-only dependency cache
+        uses: ./.github/actions/setup-gradle
+        with:
+          cache-read-only: true
+          build-scan-publish: false
+          memory-profile: auto
+
+      - name: Select isolated task cache
+        run: echo "CI_EXPERIMENT_TASK_CACHE=$RUNNER_TEMP/task-cache" >> "$GITHUB_ENV"
+
+      - name: Compile and capture independent task history and task cache
+        id: compile
+        run: bash pulsar-build/ci-cost-experiment/reuse.sh producer "$RUNNER_TEMP/reuse-state"
+
+      - name: Package compiled outputs independently of Gradle state
+        run: |
+          python3 pulsar-build/ci-cost-experiment/artifacts.py pack \
+            --workspace "$GITHUB_WORKSPACE" --output-dir "$RUNNER_TEMP/reuse-outputs"
+
+      - name: Upload common compiled outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: reuse-compiled-outputs
+          path: ${{ runner.temp }}/reuse-outputs/baseline.tar
+          compression-level: 1
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload task history separately
+        uses: actions/upload-artifact@v7
+        with:
+          name: reuse-history
+          path: ${{ runner.temp }}/reuse-state/reuse-history.tar
+          compression-level: 1
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload task cache separately
+        uses: actions/upload-artifact@v7
+        with:
+          name: reuse-task-cache
+          path: ${{ runner.temp }}/reuse-state/reuse-task-cache.tar
+          compression-level: 1
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload producer logs and measurements
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reuse-producer-metrics
+          path: |
+            ${{ runner.temp }}/reuse-state/*.json
+            ${{ runner.temp }}/reuse-state/*.log
+            ${{ runner.temp }}/reuse-state/*.resources.txt
+            ${{ runner.temp }}/reuse-state/*-profile/**
+            ${{ runner.temp }}/reuse-outputs/manifest.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  reuse-consumer:
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    needs: reuse-producer
+    name: Output reuse - ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, history, cache]
+    env:
+      REUSE_VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Checkout experiment
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+
+      - name: Set up JDK 17 and 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: corretto
+          java-version: |
+            17
+            25
+
+      - name: Setup Gradle with read-only dependency cache
+        uses: ./.github/actions/setup-gradle
+        with:
+          cache-read-only: true
+          build-scan-publish: false
+          memory-profile: auto
+
+      - name: Download identical compiled outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: reuse-compiled-outputs
+          path: ${{ runner.temp }}/reuse-outputs
+
+      - name: Download only the selected additional state
+        if: ${{ matrix.variant != 'baseline' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: reuse-${{ matrix.variant == 'history' && 'history' || 'task-cache' }}
+          path: ${{ runner.temp }}/reuse-state
+
+      - name: Restore common compiled outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/reuse-state"
+          tar -xf "$RUNNER_TEMP/reuse-outputs/baseline.tar" -C "$GITHUB_WORKSPACE"
+
+      - name: Select isolated task cache
+        run: echo "CI_EXPERIMENT_TASK_CACHE=$RUNNER_TEMP/task-cache" >> "$GITHUB_ENV"
+
+      - name: Measure reuse, execute smoke test, and check invalidation
+        id: measure
+        run: |
+          bash pulsar-build/ci-cost-experiment/reuse.sh consumer "$REUSE_VARIANT" \
+            "$RUNNER_TEMP/reuse-state" "$RUNNER_TEMP/reuse-results"
+
+      - name: Summarize reuse measurements and step outcome
+        if: ${{ always() }}
+        env:
+          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/reuse-results"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          directory = Path(os.environ['RUNNER_TEMP']) / 'reuse-results'
+          result = {'variant': os.environ['REUSE_VARIANT'],
+                    'experiment_sha': os.environ['GITHUB_SHA'],
+                    'measure_outcome': os.environ['MEASURE_OUTCOME'], 'phases': {}}
+          for name in ('compile', 'smoke', 'mutation', 'smoke-verification', 'mutation-verification'):
+              path = directory / (name + '.json')
+              if path.exists():
+                  detail = json.loads(path.read_text())
+                  result['phases'][name] = {key: value for key, value in detail.items()
+                                            if key not in ('tasks', 'compilation_tasks')}
+          (directory / 'reuse-result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              summary.write('### Output reuse result\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
+
+      - name: Upload reuse consumer logs and measurements
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reuse-results-${{ matrix.variant }}
+          path: ${{ runner.temp }}/reuse-results
+          retention-days: 3
+          if-no-files-found: warn
