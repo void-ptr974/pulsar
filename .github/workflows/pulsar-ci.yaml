@@ -328,16 +328,7 @@ jobs:
         with:
           develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
 
-      - name: Restore build outputs from build job
-        uses: actions/download-artifact@v8
-        with:
-          name: gradle-build-outputs
-
-      - name: Extract build outputs
-        run: |
-          tar xf gradle-build-outputs.tar
-          rm -f -- gradle-build-outputs.tar
-
+      # Let Gradle restore or rebuild the outputs needed by each unit test group.
       - name: Run setup commands
         if: ${{ matrix.setup }}
         run: |
