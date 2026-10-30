@@ -223,9 +223,12 @@ jobs:
 
       - name: Save build outputs for test jobs
         run: |
-          # Tar up compiled classes, resources, and distribution archives so test jobs
-          # don't need to recompile. Distribution tarballs are needed for Docker image builds.
-          find . \( -path '*/build/classes/*' -o -path '*/build/generated/*' -o -path '*/build/resources/*' \
+          # Share compiled outputs and distribution archives with downstream test
+          # and Docker image jobs. Distribution tarballs are needed for Docker image builds.
+          # Performance application TAR/ZIP bundles are not inputs of these jobs.
+          # Their compiled classes, resources, and libraries are still included.
+          find . -path './tests/performance/*/build/distributions' -prune -o \
+            \( -path '*/build/classes/*' -o -path '*/build/generated/*' -o -path '*/build/resources/*' \
             -o -path '*/build/libs/*' -o -path '*/build/tmp/jar/*' -o -path '*/build/distributions/*' \) -print \
             | tar cf /tmp/gradle-build-outputs.tar --files-from=-
 
