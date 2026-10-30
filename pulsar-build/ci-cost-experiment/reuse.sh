@@ -124,23 +124,19 @@ run_gradle() {
     set -e
     finished=$(python3 -c 'import time; print(time.time())')
     python3 - "$output_dir/$phase.log" "$output_dir/$phase.json" "$phase" \
-        "$variant" "$started" "$finished" "$status" <<'PY'
+        "$variant" "$started" "$finished" "$status" "$script_dir" <<'PY'
 import collections
 import json
 from pathlib import Path
-import re
 import shutil
 import sys
 
-log_path, json_path, phase, variant, started, finished, status = sys.argv[1:]
-tasks = []
-for line in Path(log_path).read_text(errors="replace").splitlines():
-    match = re.fullmatch(
-        r"> Task (:\S+?)(?: (UP-TO-DATE|FROM-CACHE|SKIPPED|NO-SOURCE|FAILED))?", line
-    )
-    if match:
-        tasks.append({"path": match[1], "outcome": match[2] or "EXECUTED"})
-compilation = [task for task in tasks if re.search(r":compile(?:Test)?(?:Java|Kotlin)$", task["path"])]
+log_path, json_path, phase, variant, started, finished, status, script_dir = sys.argv[1:]
+sys.path.insert(0, script_dir)
+import reuse_metrics
+
+tasks = reuse_metrics.parse_tasks(Path(log_path).read_text(errors="replace"))
+compilation = reuse_metrics.compilation_tasks(tasks)
 report = {
     "phase": phase,
     "variant": variant,
@@ -159,7 +155,8 @@ if resources_path.exists():
             resources[key] = value
     report["process_resources"] = resources
     report["process_resources_note"] = (
-        "GNU time process-tree statistics; maximum RSS is not simultaneous total job memory"
+        "GNU time launcher statistics may omit detached Gradle daemons and test workers; "
+        "CPU and RSS are not whole-build measurements"
     )
 Path(json_path).write_text(json.dumps(report, indent=2) + "\n")
 profile_directory = Path("build/reports/profile")
@@ -205,19 +202,28 @@ run_gradle compile :pulsar-broker:testClasses
 run_gradle smoke :pulsar-broker:test \
     --tests org.apache.pulsar.broker.service.EntryBatchIndexesAcksTest \
     -PtestRetryCount=0 -PtestFailFast=false
-python3 - "$output_dir" <<'PY'
+python3 - "$output_dir" "$script_dir" <<'PY'
 import json
 from pathlib import Path
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 
 directory = Path(sys.argv[1])
-report = json.loads((directory / "smoke.json").read_text())
-test_task = [task for task in report["tasks"] if task["path"] == ":pulsar-broker:test"]
-if len(test_task) != 1 or test_task[0]["outcome"] != "EXECUTED":
-    raise SystemExit("Smoke test must execute, not reuse a previous test result")
-cases = []
+sys.path.insert(0, sys.argv[2])
+import reuse_metrics
+
+saved_reports = directory / "smoke-test-results"
+saved_reports.mkdir(exist_ok=True)
 for path in Path("pulsar-broker/build/test-results/test").glob("TEST-*.xml"):
+    shutil.copy2(path, saved_reports / path.name)
+report = json.loads((directory / "smoke.json").read_text())
+try:
+    reuse_metrics.require_executed_task(report["tasks"], ":pulsar-broker:test")
+except ValueError as error:
+    raise SystemExit(str(error)) from error
+cases = []
+for path in saved_reports.glob("TEST-*.xml"):
     for case in ET.parse(path).iter("testcase"):
         if case.get("classname") == "org.apache.pulsar.broker.service.EntryBatchIndexesAcksTest":
             cases.append(case)
@@ -232,15 +238,19 @@ source_backup="$output_dir/mutation-source-original.java"
 cp "$source_path" "$source_backup"
 printf '\n// CI cost experiment: changed source must invalidate compilation.\n' >> "$source_path"
 run_gradle mutation :pulsar-broker:compileJava
-python3 - "$output_dir" <<'PY'
+python3 - "$output_dir" "$script_dir" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 directory = Path(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+import reuse_metrics
+
 report = json.loads((directory / "mutation.json").read_text())
-tasks = [task for task in report["compilation_tasks"] if task["path"] == ":pulsar-broker:compileJava"]
-if len(tasks) != 1 or tasks[0]["outcome"] != "EXECUTED":
-    raise SystemExit("Changed broker source did not invalidate compileJava as expected")
-(directory / "mutation-verification.json").write_text(json.dumps(tasks[0], indent=2) + "\n")
+try:
+    task = reuse_metrics.require_executed_task(report["compilation_tasks"], ":pulsar-broker:compileJava")
+except ValueError as error:
+    raise SystemExit(str(error)) from error
+(directory / "mutation-verification.json").write_text(json.dumps(task, indent=2) + "\n")
 PY

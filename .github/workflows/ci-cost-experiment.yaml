@@ -50,7 +50,8 @@ concurrency:
 # maximum, excluding runner startup/post-job overhead. No full test groups run.
 jobs:
   transport-producer:
-    if: ${{ github.repository == 'void-ptr974/pulsar' && (github.event_name == 'push' || inputs.experiment == 'both' || inputs.experiment == 'transport') }}
+    # Transport is complete; parser corrections only need the reuse jobs on push.
+    if: ${{ github.repository == 'void-ptr974/pulsar' && github.event_name == 'workflow_dispatch' && (inputs.experiment == 'both' || inputs.experiment == 'transport') }}
     name: Transport - prepare identical source payloads
     runs-on: ubuntu-24.04
     timeout-minutes: 20
