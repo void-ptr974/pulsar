@@ -1,0 +1,174 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: Personal CI diagnostics
+on:
+  push:
+    branches: [ci/diagnostics-20261031]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-ci-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  JDK_DISTRIBUTION: corretto
+  CI_JDK_MAJOR_VERSION: '25'
+
+jobs:
+  # Preserve the producer job identity used by setup-gradle cache keys.
+  build-and-license-check:
+    name: Prepare Gradle cache
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      JOB_NAME: Build and License check
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Set up JDK 17 and 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: |
+            17
+            25
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: false
+      - name: Prepare the same compiled outputs as the CI producer
+        run: >-
+          python3 pulsar-build/ci_observe.py --output build/ci-observability/producer --
+          ./gradlew assemble rat spotlessCheck checkstyleMain checkstyleTest
+          --no-configuration-cache --profile
+      - name: Upload producer diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostics-producer-${{ github.run_attempt }}
+          path: |
+            build/ci-observability/
+            **/build/reports/profile/
+          retention-days: 3
+          compression-level: 1
+          if-no-files-found: warn
+
+  unit-tests:
+    name: Diagnose Broker Group 1
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    needs: build-and-license-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Brokers - Broker Group 1
+            group: BROKER_GROUP_1
+            timeout: 70
+    env:
+      JOB_NAME: CI - Unit - Brokers - Broker Group 1
+      TRACE_TEST_RESOURCE_CLEANUP: 'off'
+      TRACE_TEST_RESOURCE_CLEANUP_DIR: ${{ github.workspace }}/build/trace-test-resource-cleanup
+      THREAD_LEAK_DETECTOR_WAIT_MILLIS: '10000'
+      THREAD_LEAK_DETECTOR_DIR: ${{ github.workspace }}/build/thread-leak-dumps
+      NETTY_LEAK_DETECTION: report
+      NETTY_LEAK_DUMP_DIR: ${{ github.workspace }}/build/netty-leak-dumps
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: true
+      - name: Run the original Broker Group 1 with timing reports
+        run: >-
+          python3 pulsar-build/ci_observe.py --output build/ci-observability/group1 --
+          ./pulsar-build/run_unit_group_gradle.sh ${{ matrix.group }} --profile
+      - name: Aggregate test reports
+        if: ${{ always() }}
+        uses: ./.github/actions/copy-test-reports
+      - name: Report detected Netty leaks
+        if: ${{ always() }}
+        run: ./pulsar-build/pulsar_ci_tool.sh report_netty_leaks
+      - name: Upload unit diagnostics including successful tests
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostics-group1-${{ github.run_attempt }}
+          path: |
+            build/ci-observability/
+            test-reports/
+            **/build/reports/profile/
+            **/build/reports/tests/
+          retention-days: 3
+          compression-level: 1
+          if-no-files-found: warn
+
+  macos-build:
+    name: Diagnose macOS assemble
+    if: ${{ github.repository == 'void-ptr974/pulsar' }}
+    needs: build-and-license-check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+      - name: Tune Runner VM
+        uses: ./.github/actions/tune-runner-vm
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JDK_DISTRIBUTION }}
+          java-version: ${{ env.CI_JDK_MAJOR_VERSION }}
+      - name: Setup Gradle
+        uses: ./.github/actions/setup-gradle
+        with:
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          cache-read-only: true
+      - name: Run the original assemble with timing reports
+        run: >-
+          python3 pulsar-build/ci_observe.py --output build/ci-observability/macos --
+          ./gradlew assemble --profile
+      - name: Upload macOS diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostics-macos-${{ github.run_attempt }}
+          path: |
+            build/ci-observability/
+            **/build/reports/profile/
+          retention-days: 3
+          compression-level: 1
+          if-no-files-found: warn
