@@ -482,17 +482,33 @@ public class PersistentSubscription extends AbstractSubscription {
     CompletableFuture<Void> acknowledgeReplicatedSubscriptionMessage(Position position, Position admittedMarkDelete,
             CompletableFuture<Void> admittedReset, boolean admittedDuringReset) {
         return FutureUtil.supplySafely(() -> {
+            CompletableFuture<Void> ackFuture;
+            Position markDeleteBeforeAck;
             synchronized (this) {
                 if (admittedDuringReset || lastCursorResetFuture != admittedReset
                         || admittedReset != null && !admittedReset.isDone()
                         || cursor.getMarkDeletedPosition().compareTo(admittedMarkDelete) < 0) {
                     return CompletableFuture.completedFuture(null);
                 }
+                markDeleteBeforeAck = cursor.getMarkDeletedPosition();
                 // resetCursor uses the same monitor for admission. Start the ACK before a later
                 // reset can be admitted, without waiting for asynchronous persistence to complete.
-                return acknowledgeMessageAsync(Collections.singletonList(position), AckType.Cumulative,
+                ackFuture = acknowledgeMessageAsync(Collections.singletonList(position), AckType.Cumulative,
                         Collections.emptyMap());
             }
+            // The remote cluster's ACK moves the mark-delete position past entries that local consumers may still
+            // hold, and they might never ACK them. The ACK can complete synchronously, so attach this outside the
+            // monitor to avoid running the dispatcher's cleanup, which takes the dispatcher's lock, while holding it.
+            // A failed ACK can still have moved the in-memory mark-delete position, since the cursor updates it
+            // before persisting it, and the controller doesn't retry an update the position already covers. Clean up
+            // whenever the position moved, and keep the ACK's own outcome.
+            return ackFuture.whenComplete((__, ackFailure) -> {
+                Dispatcher currentDispatcher = dispatcher;
+                if (currentDispatcher != null && (ackFailure == null
+                        || cursor.getMarkDeletedPosition().compareTo(markDeleteBeforeAck) > 0)) {
+                    currentDispatcher.markDeletePositionMoveForward();
+                }
+            });
         });
     }
 
@@ -1504,8 +1520,15 @@ public class PersistentSubscription extends AbstractSubscription {
         return cursor.getEstimatedSizeSinceMarkDeletePosition();
     }
 
-    @SuppressWarnings("deprecation")
     public CompletableFuture<SubscriptionStatsImpl> getStatsAsync(GetStatsOptions getStatsOptions) {
+        long backlogSize = getStatsOptions.isSubscriptionBacklogSize()
+                ? topic.getManagedLedger().getEstimatedBacklogSize(cursor.getMarkDeletedPosition()) : -1;
+        return getStatsAsync(getStatsOptions, backlogSize);
+    }
+
+    @SuppressWarnings("deprecation")
+    CompletableFuture<SubscriptionStatsImpl> getStatsAsync(GetStatsOptions getStatsOptions,
+                                                           long backlogSize) {
         SubscriptionStatsImpl subStats = new SubscriptionStatsImpl();
         subStats.lastExpireTimestamp = lastExpireTimestamp;
         subStats.lastConsumedFlowTimestamp = lastConsumedFlowTimestamp;
@@ -1594,12 +1617,7 @@ public class PersistentSubscription extends AbstractSubscription {
         subStats.msgBacklog = getNumberOfEntriesInBacklog(getStatsOptions.isGetPreciseBacklog());
         subStats.oldestBacklogMessageAgeSeconds =
                 topic.getBestEffortOldestUnacknowledgedMessageAgeSeconds(subName);
-        if (getStatsOptions.isSubscriptionBacklogSize()) {
-            subStats.backlogSize = topic.getManagedLedger()
-                    .getEstimatedBacklogSize(cursor.getMarkDeletedPosition());
-        } else {
-            subStats.backlogSize = -1;
-        }
+        subStats.backlogSize = backlogSize;
         subStats.msgBacklogNoDelayed = subStats.msgBacklog - subStats.msgDelayed;
         if (Subscription.isIndividualAckMode(subType)
                 && dispatcher instanceof AbstractPersistentDispatcherMultipleConsumers d
